@@ -5,6 +5,7 @@ import json
 import random
 import sys
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 
 
 KEYWORDS = {
@@ -20,6 +21,19 @@ KEYWORDS = {
     "OPEN",
     "OPTIONAL",
 }
+
+MUTATION_FIELDS = (
+    "fresh_node_probability",
+    "fresh_edge_probability",
+    "extra_label_probability",
+    "extra_property_probability",
+    "invalid_optional_property_probability",
+    "wrong_property_datatype_probability",
+    "missing_required_property_probability",
+    "missing_required_label_probability",
+    "typo_label_probability",
+    "typo_property_key_probability",
+)
 
 
 class Token:
@@ -367,12 +381,97 @@ class GraphType:
         self.elements = elements
 
 
+@dataclass(frozen=True)
+class MutationRates:
+    fresh_node_probability: float = 0.0
+    fresh_edge_probability: float = 0.0
+    extra_label_probability: float = 0.0
+    extra_property_probability: float = 0.0
+    invalid_optional_property_probability: float = 0.0
+    wrong_property_datatype_probability: float = 0.0
+    missing_required_property_probability: float = 0.0
+    missing_required_label_probability: float = 0.0
+    typo_label_probability: float = 0.0
+    typo_property_key_probability: float = 0.0
+
+
+class MutationPlan:
+    def __init__(self, defaults=None, per_type=None):
+        self.defaults = defaults or MutationRates()
+        self.per_type = per_type or {}
+
+    def for_type(self, type_name):
+        return self.per_type.get(type_name, self.defaults)
+
+
+class MutationReport:
+    def __init__(self):
+        self._objects = []
+        self._objects_by_id = {}
+        self._by_kind = {}
+
+    def record_object_mutations(
+        self,
+        object_id,
+        object_kind,
+        type_name,
+        mutations,
+        source=None,
+        target=None,
+    ):
+        if not mutations:
+            return
+
+        entry = self._objects_by_id.get(object_id)
+        if entry is None:
+            entry = {
+                "id": object_id,
+                "kind": object_kind,
+                "type": type_name,
+                "mutations": [],
+            }
+            if source is not None:
+                entry["source"] = source
+            if target is not None:
+                entry["target"] = target
+            self._objects.append(entry)
+            self._objects_by_id[object_id] = entry
+
+        entry["mutations"].extend(mutations)
+        for mutation in mutations:
+            kind = mutation["kind"]
+            self._by_kind[kind] = self._by_kind.get(kind, 0) + 1
+
+    def to_dict(self, nodes, edges, meta=None):
+        meta_payload = dict(meta or {})
+        mutated_nodes = sum(1 for entry in self._objects if entry["kind"] == "node")
+        mutated_edges = sum(1 for entry in self._objects if entry["kind"] == "edge")
+        return {
+            "meta": meta_payload,
+            "summary": {
+                "nodes_total": len(nodes),
+                "edges_total": len(edges),
+                "mutated_nodes": mutated_nodes,
+                "mutated_edges": mutated_edges,
+                "by_kind": dict(sorted(self._by_kind.items())),
+            },
+            "objects": self._objects,
+        }
+
+    def write_json(self, path, nodes, edges, meta=None):
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.to_dict(nodes, edges, meta=meta), handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+
+
 class NodeInstance:
-    def __init__(self, node_id, labels, props, type_name):
+    def __init__(self, node_id, labels, props, type_name, schema_labels=None, schema_props=None):
         self.node_id = node_id
         self.labels = labels
         self.props = props
         self.type_name = type_name
+        self.schema_labels = list(schema_labels) if schema_labels is not None else list(labels)
+        self.schema_props = dict(schema_props) if schema_props is not None else dict(props)
 
 
 class EdgeInstance:
@@ -465,6 +564,61 @@ def _collect_label_names(ast):
     if kind == "optional":
         return _collect_label_names(ast[1])
     return set()
+
+
+def _validate_probability(name, value, context):
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{context}: {name} must be between 0.0 and 1.0")
+
+
+def _mutation_rates_from_mapping(mapping, base=None, context="mutation config"):
+    values = dict(vars(base or MutationRates()))
+    for field in MUTATION_FIELDS:
+        if field in mapping and mapping[field] is not None:
+            values[field] = float(mapping[field])
+    rates = MutationRates(**values)
+    for field in MUTATION_FIELDS:
+        _validate_probability(field, getattr(rates, field), context)
+    return rates
+
+
+def load_mutation_plan(path=None, cli_overrides=None):
+    payload = {}
+    if path:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise ValueError("Mutation config must be a JSON object")
+
+    raw_defaults = payload.get("defaults")
+    if raw_defaults is None:
+        raw_defaults = payload.get("global", {})
+    if raw_defaults is None:
+        raw_defaults = {}
+    if not isinstance(raw_defaults, dict):
+        raise ValueError("Mutation config 'defaults' must be an object")
+
+    defaults = _mutation_rates_from_mapping(raw_defaults, context="mutation defaults")
+    if cli_overrides:
+        defaults = _mutation_rates_from_mapping(cli_overrides, base=defaults, context="CLI mutations")
+
+    raw_types = payload.get("types", {})
+    if raw_types is None:
+        raw_types = {}
+    if not isinstance(raw_types, dict):
+        raise ValueError("Mutation config 'types' must be an object")
+
+    per_type = {}
+    for type_name, type_mapping in raw_types.items():
+        if not isinstance(type_mapping, dict):
+            raise ValueError(f"Mutation config for type {type_name} must be an object")
+        per_type[type_name] = _mutation_rates_from_mapping(
+            type_mapping,
+            base=defaults,
+            context=f"mutation type {type_name}",
+        )
+
+    return MutationPlan(defaults, per_type)
 
 
 class RecordSpec:
@@ -837,17 +991,347 @@ def generate_value(prop_type, rng, scale_factor, idx, prop_name, faker=None):
     if t == "STRING":
         if faker:
             return _fake_string(prop_name, faker, scale_factor)
-        return f"{prop_name}_{idx}"
     return f"{prop_name}_{idx}"
 
 
+def generate_invalid_value(prop_type, rng, scale_factor, idx, prop_name, faker=None):
+    t = _canonical_prop_type(prop_type)
+    if t in {"INT", "FLOAT", "BOOLEAN"}:
+        return f"invalid_{prop_name}_{idx}"
+    if t == "DATE":
+        return f"not-a-date-{idx}"
+    if t == "DATETIME":
+        return f"not-a-datetime-{idx}"
+    if t == "STRING":
+        return generate_value("INT", rng, scale_factor, idx, prop_name, faker)
+    return None
+
+
+def _typo_variant(text, rng, forbidden=None):
+    forbidden = forbidden or set()
+    if not text:
+        return "typo"
+
+    for _ in range(8):
+        if len(text) >= 2 and rng.random() < 0.5:
+            idx = rng.randint(0, len(text) - 2)
+            chars = list(text)
+            chars[idx], chars[idx + 1] = chars[idx + 1], chars[idx]
+            candidate = "".join(chars)
+        else:
+            idx = rng.randint(0, len(text) - 1)
+            chars = list(text)
+            source = chars[idx]
+            if source.isupper():
+                alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            elif source.islower():
+                alphabet = "abcdefghijklmnopqrstuvwxyz"
+            elif source.isdigit():
+                alphabet = "0123456789"
+            else:
+                alphabet = "abcdefghijklmnopqrstuvwxyz"
+            replacements = [char for char in alphabet if char != source]
+            chars[idx] = rng.choice(replacements) if replacements else "x"
+            candidate = "".join(chars)
+        if candidate != text and candidate not in forbidden:
+            return candidate
+
+    candidate = f"{text}_typo"
+    while candidate in forbidden:
+        candidate = f"{candidate}x"
+    return candidate
+
+
+def _fresh_label_name(rng, schema_labels, existing, prefix):
+    while True:
+        candidate = f"{prefix}{rng.randint(1, 999999)}"
+        if candidate not in schema_labels and candidate not in existing:
+            return candidate
+
+
+def _fresh_prop_name(rng, existing, prefix):
+    while True:
+        candidate = f"{prefix}_{rng.randint(1, 999999)}"
+        if candidate not in existing:
+            return candidate
+
+
+def _generate_fresh_props(rng, scale_factor, idx, faker, prefix):
+    prop_count = 1 + rng.randint(0, 1)
+    props = {}
+    for extra_idx in range(prop_count):
+        key = _fresh_prop_name(rng, set(props.keys()), prefix)
+        props[key] = generate_value("STRING", rng, scale_factor, idx + extra_idx, key, faker)
+    return props
+
+
+def _preferred_property_key(record_spec, props=None):
+    if props is None:
+        required_keys = sorted(record_spec.required.keys())
+        if required_keys:
+            return required_keys
+        return sorted(record_spec.optional.keys())
+
+    required_keys = [key for key in sorted(record_spec.required.keys()) if key in props]
+    if required_keys:
+        return required_keys
+    return [key for key in sorted(record_spec.optional.keys()) if key in props]
+
+
+def _apply_nonconforming_mutations(
+    labels,
+    props,
+    option,
+    mutation_rates,
+    rng,
+    scale_factor,
+    idx,
+    schema_labels,
+    faker=None,
+):
+    mutated_labels = list(labels)
+    mutated_props = dict(props)
+    mutations = []
+
+    if (
+        mutation_rates.extra_label_probability
+        and not option.label_open
+        and rng.random() < mutation_rates.extra_label_probability
+    ):
+        extra_label = _fresh_label_name(
+            rng,
+            schema_labels,
+            set(mutated_labels),
+            "MutatedLabel",
+        )
+        mutated_labels.append(extra_label)
+        mutations.append({"kind": "extra_label", "before": None, "after": extra_label})
+
+    if (
+        mutation_rates.extra_property_probability
+        and not option.record_spec.open
+        and rng.random() < mutation_rates.extra_property_probability
+    ):
+        extra_key = _fresh_prop_name(rng, set(mutated_props.keys()), "mutated_prop")
+        mutated_props[extra_key] = generate_value(
+            "STRING",
+            rng,
+            scale_factor,
+            idx,
+            extra_key,
+            faker,
+        )
+        mutations.append(
+            {
+                "kind": "extra_property",
+                "property": extra_key,
+                "before": None,
+                "after": mutated_props[extra_key],
+            }
+        )
+
+    if (
+        mutation_rates.invalid_optional_property_probability
+        and option.record_spec.optional
+        and rng.random() < mutation_rates.invalid_optional_property_probability
+    ):
+        bad_key = rng.choice(sorted(option.record_spec.optional.keys()))
+        before = mutated_props.get(bad_key)
+        mutated_props[bad_key] = generate_invalid_value(
+            option.record_spec.optional[bad_key],
+            rng,
+            scale_factor,
+            idx,
+            bad_key,
+            faker,
+        )
+        mutations.append(
+            {
+                "kind": "invalid_optional_property",
+                "property": bad_key,
+                "expected": option.record_spec.optional[bad_key],
+                "before": before,
+                "after": mutated_props[bad_key],
+            }
+        )
+
+    if (
+        mutation_rates.wrong_property_datatype_probability
+        and (option.record_spec.required or option.record_spec.optional)
+        and rng.random() < mutation_rates.wrong_property_datatype_probability
+    ):
+        candidate_keys = _preferred_property_key(option.record_spec)
+        bad_key = rng.choice(candidate_keys)
+        prop_type = option.record_spec.required.get(bad_key) or option.record_spec.optional[bad_key]
+        before = mutated_props.get(bad_key)
+        mutated_props[bad_key] = generate_invalid_value(
+            prop_type,
+            rng,
+            scale_factor,
+            idx,
+            bad_key,
+            faker,
+        )
+        mutations.append(
+            {
+                "kind": "wrong_property_datatype",
+                "property": bad_key,
+                "expected": prop_type,
+                "before": before,
+                "after": mutated_props[bad_key],
+            }
+        )
+
+    if (
+        mutation_rates.missing_required_property_probability
+        and option.record_spec.required
+        and rng.random() < mutation_rates.missing_required_property_probability
+    ):
+        missing_key = rng.choice(sorted(option.record_spec.required.keys()))
+        removed_value = mutated_props.pop(missing_key, None)
+        mutations.append(
+            {
+                "kind": "missing_required_property",
+                "property": missing_key,
+                "before": removed_value,
+                "after": None,
+            }
+        )
+
+    if (
+        mutation_rates.missing_required_label_probability
+        and option.labels
+        and rng.random() < mutation_rates.missing_required_label_probability
+    ):
+        removable = [label for label in mutated_labels if label in option.labels]
+        if removable:
+            removed_label = rng.choice(removable)
+            mutated_labels.remove(removed_label)
+            mutations.append(
+                {
+                    "kind": "missing_required_label",
+                    "before": removed_label,
+                    "after": None,
+                }
+            )
+
+    if (
+        mutation_rates.typo_label_probability
+        and option.labels
+        and rng.random() < mutation_rates.typo_label_probability
+    ):
+        typo_candidates = [label for label in mutated_labels if label in option.labels]
+        if typo_candidates:
+            original = rng.choice(typo_candidates)
+            typo = _typo_variant(
+                original,
+                rng,
+                forbidden=set(schema_labels) | set(mutated_labels),
+            )
+            mutated_labels[mutated_labels.index(original)] = typo
+            mutations.append({"kind": "typo_label", "before": original, "after": typo})
+
+    if (
+        mutation_rates.typo_property_key_probability
+        and mutated_props
+        and rng.random() < mutation_rates.typo_property_key_probability
+    ):
+        typo_candidates = _preferred_property_key(option.record_spec, mutated_props)
+        if typo_candidates:
+            original = rng.choice(typo_candidates)
+            value = mutated_props.pop(original)
+            typo_key = _typo_variant(
+                original,
+                rng,
+                forbidden=set(mutated_props.keys())
+                | set(option.record_spec.required.keys())
+                | set(option.record_spec.optional.keys()),
+            )
+            mutated_props[typo_key] = value
+            mutations.append(
+                {
+                    "kind": "typo_property_key",
+                    "property": original,
+                    "before": original,
+                    "after": typo_key,
+                    "value": value,
+                }
+            )
+
+    return sorted(dict.fromkeys(mutated_labels)), mutated_props, mutations
+
+
+def _append_fresh_node(nodes, rng, scale_factor, schema_labels, faker=None, mutation_report=None):
+    label = _fresh_label_name(rng, schema_labels, set(), "FreshNode")
+    props = _generate_fresh_props(rng, scale_factor, len(nodes), faker, "fresh_node_prop")
+    node = NodeInstance(f"n{len(nodes)}", [label], props, "__fresh_node__")
+    nodes.append(node)
+    if mutation_report is not None:
+        mutation_report.record_object_mutations(
+            node.node_id,
+            "node",
+            node.type_name,
+            [
+                {
+                    "kind": "fresh_node",
+                    "labels": list(node.labels),
+                    "properties": dict(node.props),
+                }
+            ],
+        )
+    return node
+
+
+def _append_fresh_edge(edges, nodes, rng, scale_factor, schema_labels, faker=None, mutation_report=None):
+    while len(nodes) < 2:
+        _append_fresh_node(nodes, rng, scale_factor, schema_labels, faker, mutation_report)
+    label = _fresh_label_name(rng, schema_labels, set(), "FreshEdge")
+    props = _generate_fresh_props(rng, scale_factor, len(edges), faker, "fresh_edge_prop")
+    source = rng.choice(nodes)
+    target = rng.choice(nodes)
+    edge = EdgeInstance(
+        f"e{len(edges)}",
+        source.node_id,
+        target.node_id,
+        [label],
+        props,
+        "__fresh_edge__",
+    )
+    edges.append(edge)
+    if mutation_report is not None:
+        mutation_report.record_object_mutations(
+            edge.edge_id,
+            "edge",
+            edge.type_name,
+            [
+                {
+                    "kind": "fresh_edge",
+                    "labels": list(edge.labels),
+                    "properties": dict(edge.props),
+                }
+            ],
+            source=edge.source,
+            target=edge.target,
+        )
+    return edge
+
+
 def generate_instances(
-    graph_type, node_types, edge_types, scale_factor, rng, faker=None, force_open_extras=0
+    graph_type,
+    node_types,
+    edge_types,
+    scale_factor,
+    rng,
+    faker=None,
+    force_open_extras=0,
+    mutation_plan=None,
+    mutation_report=None,
 ):
     nodes = []
     edges = []
     resolved_node_types = []
     resolved_edge_types = []
+    mutation_plan = mutation_plan or MutationPlan()
 
     for element in graph_type.elements:
         if isinstance(element, NodeType):
@@ -912,6 +1396,7 @@ def generate_instances(
     for node_type in resolved_node_types:
         if node_type.abstract:
             continue
+        mutation_rates = mutation_plan.for_type(node_type.name)
         options = semantics.eval_node_type(node_type.name)
         if not options:
             raise ValueError(f"No valid instances for node type {node_type.name}")
@@ -924,21 +1409,73 @@ def generate_instances(
                     if extra:
                         labels.append(extra)
             props = _generate_record(option.record_spec, len(nodes))
+            schema_labels = list(labels)
+            schema_props = dict(props)
+            labels, props, mutations = _apply_nonconforming_mutations(
+                labels,
+                props,
+                option,
+                mutation_rates,
+                rng,
+                scale_factor,
+                len(nodes),
+                label_pool,
+                faker,
+            )
             node_id = f"n{len(nodes)}"
-            nodes.append(NodeInstance(node_id, labels, props, node_type.name))
+            nodes.append(
+                NodeInstance(
+                    node_id,
+                    labels,
+                    props,
+                    node_type.name,
+                    schema_labels=schema_labels,
+                    schema_props=schema_props,
+                )
+            )
+            if mutation_report is not None:
+                mutation_report.record_object_mutations(
+                    node_id,
+                    "node",
+                    node_type.name,
+                    mutations,
+                )
+            if (
+                mutation_rates.fresh_node_probability
+                and rng.random() < mutation_rates.fresh_node_probability
+            ):
+                _append_fresh_node(
+                    nodes,
+                    rng,
+                    scale_factor,
+                    label_pool,
+                    faker,
+                    mutation_report,
+                )
 
     base_edges_per_type = 15
     edges_per_type = max(1, int(scale_factor) * base_edges_per_type)
     for edge_type in resolved_edge_types:
         if edge_type.abstract:
             continue
+        mutation_rates = mutation_plan.for_type(edge_type.name)
         options = semantics.eval_edge_type(edge_type.name)
         if not options:
             continue
         option_candidates = []
         for opt in options:
-            sources = [n for n in nodes if _labels_conform(set(n.labels), opt.source) and _record_conforms(n.props, opt.source.record_spec)]
-            targets = [n for n in nodes if _labels_conform(set(n.labels), opt.target) and _record_conforms(n.props, opt.target.record_spec)]
+            sources = [
+                n
+                for n in nodes
+                if _labels_conform(set(n.schema_labels), opt.source)
+                and _record_conforms(n.schema_props, opt.source.record_spec)
+            ]
+            targets = [
+                n
+                for n in nodes
+                if _labels_conform(set(n.schema_labels), opt.target)
+                and _record_conforms(n.schema_props, opt.target.record_spec)
+            ]
             if sources and targets:
                 option_candidates.append((opt, sources, targets))
         if not option_candidates:
@@ -961,8 +1498,43 @@ def generate_instances(
                     if extra:
                         labels.append(extra)
             props = _generate_record(opt.edge.record_spec, len(edges))
+            labels, props, mutations = _apply_nonconforming_mutations(
+                labels,
+                props,
+                opt.edge,
+                mutation_rates,
+                rng,
+                scale_factor,
+                len(edges),
+                label_pool,
+                faker,
+            )
             edge_id = f"e{len(edges)}"
-            edges.append(EdgeInstance(edge_id, source.node_id, target.node_id, labels, props, edge_type.name))
+            edges.append(
+                EdgeInstance(edge_id, source.node_id, target.node_id, labels, props, edge_type.name)
+            )
+            if mutation_report is not None:
+                mutation_report.record_object_mutations(
+                    edge_id,
+                    "edge",
+                    edge_type.name,
+                    mutations,
+                    source=source.node_id,
+                    target=target.node_id,
+                )
+            if (
+                mutation_rates.fresh_edge_probability
+                and rng.random() < mutation_rates.fresh_edge_probability
+            ):
+                _append_fresh_edge(
+                    edges,
+                    nodes,
+                    rng,
+                    scale_factor,
+                    label_pool,
+                    faker,
+                    mutation_report,
+                )
     node_prop_names = set()
     edge_prop_names = set()
     for node in nodes:
@@ -1223,6 +1795,8 @@ def write_oracle_graphson(nodes, edges, path, mode="NORMAL"):
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False))
         handle.write("\n")
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description="Generate GraphML data from PG-Schema")
     parser.add_argument("schema", help="Path to PG-Schema file")
@@ -1257,6 +1831,74 @@ def main(argv):
         default=1,
         help="How many extra labels/properties to add per OPEN element (requires --open-extra)",
     )
+    parser.add_argument(
+        "--mutation-config",
+        help="Optional JSON file with non-conforming mutation probabilities, optionally per type",
+    )
+    parser.add_argument(
+        "--mutation-report",
+        help="Optional JSON file path for mutation statistics and per-object mutation details",
+    )
+    parser.add_argument(
+        "--mutation-fresh-node-prob",
+        type=float,
+        default=None,
+        help="Probability of adding a fresh unrelated node after generating a node of a type",
+    )
+    parser.add_argument(
+        "--mutation-fresh-edge-prob",
+        type=float,
+        default=None,
+        help="Probability of adding a fresh unrelated edge after generating an edge of a type",
+    )
+    parser.add_argument(
+        "--mutation-extra-label-prob",
+        type=float,
+        default=None,
+        help="Probability of adding a fresh label to a closed node/edge",
+    )
+    parser.add_argument(
+        "--mutation-extra-prop-prob",
+        type=float,
+        default=None,
+        help="Probability of adding a fresh property to a closed node/edge record",
+    )
+    parser.add_argument(
+        "--mutation-bad-optional-prop-prob",
+        type=float,
+        default=None,
+        help="Probability of assigning an invalid value to an OPTIONAL property",
+    )
+    parser.add_argument(
+        "--mutation-wrong-prop-datatype-prob",
+        type=float,
+        default=None,
+        help="Probability of assigning an invalid value to a schema-defined property",
+    )
+    parser.add_argument(
+        "--mutation-missing-required-prop-prob",
+        type=float,
+        default=None,
+        help="Probability of omitting a required property",
+    )
+    parser.add_argument(
+        "--mutation-missing-required-label-prob",
+        type=float,
+        default=None,
+        help="Probability of omitting a required label",
+    )
+    parser.add_argument(
+        "--mutation-typo-label-prob",
+        type=float,
+        default=None,
+        help="Probability of mutating a required label with a typo",
+    )
+    parser.add_argument(
+        "--mutation-typo-prop-key-prob",
+        type=float,
+        default=None,
+        help="Probability of mutating a schema property key with a typo",
+    )
     args = parser.parse_args(argv)
 
     if args.scale < 1:
@@ -1285,7 +1927,25 @@ def main(argv):
         if args.seed is not None:
             faker.seed_instance(args.seed)
 
+    cli_mutations = {
+        "fresh_node_probability": args.mutation_fresh_node_prob,
+        "fresh_edge_probability": args.mutation_fresh_edge_prob,
+        "extra_label_probability": args.mutation_extra_label_prob,
+        "extra_property_probability": args.mutation_extra_prop_prob,
+        "invalid_optional_property_probability": args.mutation_bad_optional_prop_prob,
+        "wrong_property_datatype_probability": args.mutation_wrong_prop_datatype_prob,
+        "missing_required_property_probability": args.mutation_missing_required_prop_prob,
+        "missing_required_label_probability": args.mutation_missing_required_label_prob,
+        "typo_label_probability": args.mutation_typo_label_prob,
+        "typo_property_key_probability": args.mutation_typo_prop_key_prob,
+    }
+    try:
+        mutation_plan = load_mutation_plan(args.mutation_config, cli_mutations)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid mutation configuration: {exc}") from exc
+
     open_extra_count = args.open_extra_count if args.open_extra else 0
+    mutation_report = MutationReport() if args.mutation_report else None
     nodes, edges, node_prop_names, edge_prop_names = generate_instances(
         graph_type,
         node_types,
@@ -1294,6 +1954,8 @@ def main(argv):
         rng,
         faker,
         force_open_extras=open_extra_count,
+        mutation_plan=mutation_plan,
+        mutation_report=mutation_report,
     )
 
     out_path = args.out
@@ -1320,6 +1982,20 @@ def main(argv):
     else:
         tree = build_graphml(nodes, edges, node_prop_names, edge_prop_names)
         tree.write(out_path, encoding="utf-8", xml_declaration=True)
+
+    if mutation_report is not None:
+        mutation_report.write_json(
+            args.mutation_report,
+            nodes,
+            edges,
+            meta={
+                "schema": args.schema,
+                "graph_type": graph_type.name,
+                "seed": args.seed,
+                "scale": args.scale,
+                "format": args.format,
+            },
+        )
 
     print(f"Wrote {out_path} (nodes: {len(nodes)}, edges: {len(edges)})")
 

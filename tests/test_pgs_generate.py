@@ -12,6 +12,21 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import pgs_generate
 
 
+MUTATION_SCHEMA = """
+CREATE GRAPH TYPE G STRICT {
+  (Person: Person {id INT, OPTIONAL nick STRING}),
+  (:Person)-[Knows: KNOWS {since DATE, OPTIONAL weight INT}]->(:Person)
+};
+"""
+
+TYPO_SCHEMA = """
+CREATE GRAPH TYPE G STRICT {
+  (Person: Person {id INT}),
+  (:Person)-[Knows: KNOWS {since DATE}]->(:Person)
+};
+"""
+
+
 def _load_schema(path):
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
@@ -529,3 +544,447 @@ def test_oracle_graphson_format(tmp_path):
     edge = graph["edges"][0]
     assert edge.get("_type") == "edge"
     assert "_outV" in edge and "_inV" in edge and "_label" in edge
+
+
+def test_nonconforming_extra_label_and_prop_mutations():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(MUTATION_SCHEMA)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(23)
+    mutation_plan = pgs_generate.MutationPlan(
+        per_type={
+            "Person": pgs_generate.MutationRates(
+                extra_label_probability=1.0,
+                extra_property_probability=1.0,
+            ),
+            "Knows": pgs_generate.MutationRates(
+                extra_label_probability=1.0,
+                extra_property_probability=1.0,
+            ),
+        }
+    )
+
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_type,
+        node_types,
+        edge_types,
+        1,
+        rng,
+        mutation_plan=mutation_plan,
+    )
+
+    assert nodes
+    assert edges
+    assert all(any(label.startswith("MutatedLabel") for label in node.labels) for node in nodes)
+    assert all(any(key.startswith("mutated_prop_") for key in node.props) for node in nodes)
+    assert all(any(label.startswith("MutatedLabel") for label in edge.labels) for edge in edges)
+    assert all(any(key.startswith("mutated_prop_") for key in edge.props) for edge in edges)
+
+
+def test_nonconforming_invalid_optional_property_mutation():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(MUTATION_SCHEMA)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(24)
+    mutation_plan = pgs_generate.MutationPlan(
+        per_type={
+            "Person": pgs_generate.MutationRates(
+                invalid_optional_property_probability=1.0,
+            ),
+            "Knows": pgs_generate.MutationRates(
+                invalid_optional_property_probability=1.0,
+            ),
+        }
+    )
+
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_type,
+        node_types,
+        edge_types,
+        1,
+        rng,
+        mutation_plan=mutation_plan,
+    )
+
+    assert all("nick" in node.props for node in nodes)
+    assert all(not _is_value_of_type(node.props["nick"], "STRING") for node in nodes)
+    assert all("weight" in edge.props for edge in edges)
+    assert all(not _is_value_of_type(edge.props["weight"], "INT") for edge in edges)
+
+
+def test_nonconforming_wrong_property_datatype_mutation():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(MUTATION_SCHEMA)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(28)
+    mutation_plan = pgs_generate.MutationPlan(
+        per_type={
+            "Person": pgs_generate.MutationRates(
+                wrong_property_datatype_probability=1.0,
+            ),
+            "Knows": pgs_generate.MutationRates(
+                wrong_property_datatype_probability=1.0,
+            ),
+        }
+    )
+
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_type,
+        node_types,
+        edge_types,
+        1,
+        rng,
+        mutation_plan=mutation_plan,
+    )
+
+    assert all("id" in node.props for node in nodes)
+    assert all(not _is_value_of_type(node.props["id"], "INT") for node in nodes)
+    assert all("since" in edge.props for edge in edges)
+    assert all(not _is_value_of_type(edge.props["since"], "DATE") for edge in edges)
+
+
+def test_nonconforming_missing_required_node_fields():
+    schema = """
+    CREATE GRAPH TYPE G STRICT {
+      (Person: Person {id INT})
+    };
+    """
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(schema)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(25)
+    mutation_plan = pgs_generate.MutationPlan(
+        per_type={
+            "Person": pgs_generate.MutationRates(
+                missing_required_property_probability=1.0,
+                missing_required_label_probability=1.0,
+            )
+        }
+    )
+
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_type,
+        node_types,
+        edge_types,
+        1,
+        rng,
+        mutation_plan=mutation_plan,
+    )
+    semantics = pgs_generate.SchemaSemantics(node_types, edge_types)
+    option = semantics.eval_node_type("Person")[0]
+
+    assert nodes
+    assert not edges
+    assert all(not pgs_generate._record_conforms(node.props, option.record_spec) for node in nodes)
+    assert all(not pgs_generate._labels_conform(set(node.labels), option) for node in nodes)
+
+
+def test_nonconforming_missing_required_edge_fields():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(MUTATION_SCHEMA)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(26)
+    mutation_plan = pgs_generate.MutationPlan(
+        per_type={
+            "Knows": pgs_generate.MutationRates(
+                missing_required_property_probability=1.0,
+                missing_required_label_probability=1.0,
+            )
+        }
+    )
+
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_type,
+        node_types,
+        edge_types,
+        1,
+        rng,
+        mutation_plan=mutation_plan,
+    )
+    semantics = pgs_generate.SchemaSemantics(node_types, edge_types)
+    option = semantics.eval_edge_type("Knows")[0].edge
+
+    assert nodes
+    assert edges
+    assert all(not pgs_generate._record_conforms(edge.props, option.record_spec) for edge in edges)
+    assert all(not pgs_generate._labels_conform(set(edge.labels), option) for edge in edges)
+
+
+def test_nonconforming_typo_label_and_property_key_mutations():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(TYPO_SCHEMA)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(29)
+    mutation_plan = pgs_generate.MutationPlan(
+        per_type={
+            "Person": pgs_generate.MutationRates(
+                typo_label_probability=1.0,
+                typo_property_key_probability=1.0,
+            ),
+            "Knows": pgs_generate.MutationRates(
+                typo_label_probability=1.0,
+                typo_property_key_probability=1.0,
+            ),
+        }
+    )
+
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_type,
+        node_types,
+        edge_types,
+        1,
+        rng,
+        mutation_plan=mutation_plan,
+    )
+
+    assert nodes
+    assert edges
+    assert all(node.labels == [label] and label != "Person" for node in nodes for label in node.labels)
+    assert all("id" not in node.props and len(node.props) == 1 for node in nodes)
+    assert all(edge.labels == [label] and label != "KNOWS" for edge in edges for label in edge.labels)
+    assert all("since" not in edge.props and len(edge.props) == 1 for edge in edges)
+
+
+def test_nonconforming_fresh_nodes_and_edges():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(MUTATION_SCHEMA)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(27)
+    mutation_plan = pgs_generate.MutationPlan(
+        defaults=pgs_generate.MutationRates(
+            fresh_node_probability=1.0,
+            fresh_edge_probability=1.0,
+        )
+    )
+
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_type,
+        node_types,
+        edge_types,
+        1,
+        rng,
+        mutation_plan=mutation_plan,
+    )
+
+    assert len(nodes) > 10
+    assert len(edges) > 15
+    assert any(node.type_name == "__fresh_node__" for node in nodes)
+    assert any(edge.type_name == "__fresh_edge__" for edge in edges)
+
+
+def test_mutation_report_collects_summary_and_object_details():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(MUTATION_SCHEMA)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(30)
+    mutation_plan = pgs_generate.MutationPlan(
+        per_type={
+            "Person": pgs_generate.MutationRates(
+                extra_label_probability=1.0,
+                wrong_property_datatype_probability=1.0,
+            ),
+            "Knows": pgs_generate.MutationRates(
+                typo_label_probability=1.0,
+            ),
+        }
+    )
+    mutation_report = pgs_generate.MutationReport()
+
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_type,
+        node_types,
+        edge_types,
+        1,
+        rng,
+        mutation_plan=mutation_plan,
+        mutation_report=mutation_report,
+    )
+
+    payload = mutation_report.to_dict(
+        nodes,
+        edges,
+        meta={"schema": "memory.pgs", "graph_type": graph_type.name, "seed": 30, "scale": 1},
+    )
+
+    assert payload["meta"]["graph_type"] == graph_type.name
+    assert payload["summary"]["nodes_total"] == len(nodes)
+    assert payload["summary"]["edges_total"] == len(edges)
+    assert payload["summary"]["mutated_nodes"] > 0
+    assert payload["summary"]["mutated_edges"] > 0
+    assert payload["summary"]["by_kind"]["extra_label"] > 0
+    assert payload["summary"]["by_kind"]["wrong_property_datatype"] > 0
+    assert payload["summary"]["by_kind"]["typo_label"] > 0
+    assert any(
+        obj["kind"] == "node"
+        and any(mutation["kind"] == "wrong_property_datatype" for mutation in obj["mutations"])
+        for obj in payload["objects"]
+    )
+    assert any(
+        obj["kind"] == "edge"
+        and "source" in obj
+        and "target" in obj
+        and any(mutation["kind"] == "typo_label" for mutation in obj["mutations"])
+        for obj in payload["objects"]
+    )
+
+
+def test_load_mutation_plan_merges_defaults_types_and_cli(tmp_path):
+    config_path = tmp_path / "mutations.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "defaults": {"extra_label_probability": 0.25},
+                "types": {"Person": {"missing_required_label_probability": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    mutation_plan = pgs_generate.load_mutation_plan(
+        config_path,
+        {
+            "extra_property_probability": 0.5,
+            "typo_label_probability": 0.75,
+        },
+    )
+
+    default_rates = mutation_plan.for_type("Other")
+    person_rates = mutation_plan.for_type("Person")
+    assert default_rates.extra_label_probability == 0.25
+    assert default_rates.extra_property_probability == 0.5
+    assert default_rates.typo_label_probability == 0.75
+    assert person_rates.extra_label_probability == 0.25
+    assert person_rates.extra_property_probability == 0.5
+    assert person_rates.typo_label_probability == 0.75
+    assert person_rates.missing_required_label_probability == 1.0
+
+
+def test_cli_mutation_flags_generate_nonconforming_graphml(tmp_path):
+    schema = """
+    CREATE GRAPH TYPE G STRICT {
+      (Person: Person {id INT})
+    };
+    """
+    schema_path = tmp_path / "schema.pgs"
+    schema_path.write_text(schema, encoding="utf-8")
+    out_path = tmp_path / "out.graphml"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "pgs_generate.py",
+            str(schema_path),
+            "1",
+            "--mutation-extra-label-prob",
+            "1.0",
+            "--mutation-extra-prop-prob",
+            "1.0",
+            "-o",
+            str(out_path),
+        ],
+        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    tree = ET.parse(out_path)
+    root = tree.getroot()
+    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
+    graph = root.find("g:graph", ns)
+    nodes = graph.findall("g:node", ns)
+    assert nodes
+
+    keys = {}
+    for key_el in root.findall("g:key", ns):
+        keys[key_el.attrib["id"]] = key_el.attrib.get("attr.name", "")
+
+    for node in nodes:
+        labels = (node.attrib.get("labels") or "").split(":")
+        labels = [label for label in labels if label]
+        assert any(label.startswith("MutatedLabel") for label in labels)
+        assert any(
+            keys.get(data.attrib.get("key", ""), "").startswith("mutated_prop_")
+            for data in node.findall("g:data", ns)
+        )
+
+
+def test_cli_typo_and_wrong_datatype_flags(tmp_path):
+    schema_path = tmp_path / "schema.pgs"
+    schema_path.write_text(TYPO_SCHEMA, encoding="utf-8")
+    out_path = tmp_path / "out.graphml"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "pgs_generate.py",
+            str(schema_path),
+            "1",
+            "--mutation-wrong-prop-datatype-prob",
+            "1.0",
+            "--mutation-typo-label-prob",
+            "1.0",
+            "--mutation-typo-prop-key-prob",
+            "1.0",
+            "-o",
+            str(out_path),
+        ],
+        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    tree = ET.parse(out_path)
+    root = tree.getroot()
+    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
+    graph = root.find("g:graph", ns)
+    nodes = graph.findall("g:node", ns)
+    edges = graph.findall("g:edge", ns)
+    assert nodes
+    assert edges
+
+    keys = {}
+    for key_el in root.findall("g:key", ns):
+        keys[key_el.attrib["id"]] = key_el.attrib.get("attr.name", "")
+
+    for node in nodes:
+        labels = (node.attrib.get("labels") or "").split(":")
+        labels = [label for label in labels if label]
+        assert labels and labels[0] != "Person"
+        attr_names = [keys.get(data.attrib.get("key", ""), "") for data in node.findall("g:data", ns)]
+        assert "id" not in attr_names
+
+    for edge in edges:
+        assert edge.attrib.get("label") != "KNOWS"
+        attr_names = [keys.get(data.attrib.get("key", ""), "") for data in edge.findall("g:data", ns)]
+        assert "since" not in attr_names
+
+
+def test_cli_writes_mutation_report_json(tmp_path):
+    schema_path = tmp_path / "schema.pgs"
+    schema_path.write_text(MUTATION_SCHEMA, encoding="utf-8")
+    out_path = tmp_path / "out.graphml"
+    report_path = tmp_path / "mutation-report.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "pgs_generate.py",
+            str(schema_path),
+            "1",
+            "--mutation-extra-label-prob",
+            "1.0",
+            "--mutation-report",
+            str(report_path),
+            "-o",
+            str(out_path),
+        ],
+        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert out_path.exists()
+    assert report_path.exists()
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["meta"]["schema"] == str(schema_path)
+    assert payload["meta"]["graph_type"] == "G"
+    assert payload["summary"]["nodes_total"] > 0
+    assert payload["summary"]["mutated_nodes"] > 0
+    assert payload["summary"]["by_kind"]["extra_label"] > 0
+    assert any(obj["kind"] == "node" for obj in payload["objects"])
