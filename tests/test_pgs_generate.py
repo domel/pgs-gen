@@ -37,6 +37,16 @@ CREATE GRAPH TYPE ICIJ LOOSE {
 };
 """
 
+TYPE_REF_SCHEMA = """
+CREATE GRAPH TYPE G STRICT {
+  (PostType: Post {id STRING}),
+  (CommentType: Comment {id STRING}),
+  (PersonType: Person {id STRING}),
+  (: @PostType | @CommentType)-[HasCreatorType: HAS_CREATOR]->(: @PersonType),
+  (: @CommentType)-[ReplyOfType: REPLY_OF]->(: @CommentType | @PostType)
+};
+"""
+
 
 def _load_schema(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -241,6 +251,37 @@ def test_keyword_property_name_parses_and_generates():
     assert not edges
 
 
+def test_type_ref_prefix_parses_and_generates():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(
+        TYPE_REF_SCHEMA,
+        type_ref_prefix="@",
+    )
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(31)
+
+    nodes, edges, _, _ = pgs_generate.generate_instances(graph_type, node_types, edge_types, 1, rng)
+    semantics = pgs_generate.SchemaSemantics(node_types, edge_types)
+    nodes_by_id = {n.node_id: n for n in nodes}
+
+    assert len(nodes) == 30
+    assert len(edges) == 30
+
+    for edge in edges:
+        source = nodes_by_id[edge.source]
+        target = nodes_by_id[edge.target]
+        options = semantics.eval_edge_type(edge.type_name)
+        assert options
+        assert any(
+            pgs_generate._labels_conform(set(edge.labels), opt.edge)
+            and pgs_generate._record_conforms(edge.props, opt.edge.record_spec)
+            and pgs_generate._labels_conform(set(source.labels), opt.source)
+            and pgs_generate._record_conforms(source.props, opt.source.record_spec)
+            and pgs_generate._labels_conform(set(target.labels), opt.target)
+            and pgs_generate._record_conforms(target.props, opt.target.record_spec)
+            for opt in options
+        )
+
+
 def test_fake_value_formats():
     faker_module = pytest.importorskip("faker")
     faker = faker_module.Faker()
@@ -396,6 +437,36 @@ def test_cli_open_extra_generates_graphml(tmp_path):
             if attr_name.startswith("extra_prop_"):
                 extra_props.append(attr_name)
         assert len(extra_props) == 2
+
+
+def test_cli_type_ref_prefix_generates_graphml(tmp_path):
+    schema_path = tmp_path / "schema.pgs"
+    schema_path.write_text(TYPE_REF_SCHEMA, encoding="utf-8")
+    out_path = tmp_path / "out.graphml"
+    subprocess.run(
+        [
+            sys.executable,
+            "pgs_generate.py",
+            str(schema_path),
+            "1",
+            "--type-ref-prefix",
+            "@",
+            "-o",
+            str(out_path),
+        ],
+        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    tree = ET.parse(out_path)
+    root = tree.getroot()
+    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
+    graph = root.find("g:graph", ns)
+    assert graph is not None
+    assert graph.find("g:node", ns) is not None
+    assert graph.find("g:edge", ns) is not None
 
 
 def test_open_extras_flag_adds_labels_and_props():

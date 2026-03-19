@@ -46,6 +46,12 @@ Oracle GraphSON:
 python3 pgs_generate.py examples/FraudGraphType.pgs 1 --format oracle-graphson -o out.oracle.graphson
 ```
 
+Explicit type references with `@`:
+
+```bash
+python3 pgs_generate.py schema.pgs 1 --type-ref-prefix @ -o out.graphml
+```
+
 ## CLI Options
 
 - `--format`: output format
@@ -55,6 +61,7 @@ python3 pgs_generate.py examples/FraudGraphType.pgs 1 --format oracle-graphson -
   - `oracle-graphson` -> Oracle Property Graph GraphSON
 - `-f/--fake`: use Faker for more realistic values
 - `--seed`: deterministic random data
+- `--type-ref-prefix PREFIX`: optional explicit type-reference prefix in label expressions, for example `@PersonType`
 - `--open-extra`: when `OPEN` is used, force extra labels/properties
 - `--open-extra-count N`: how many extra labels/properties to add per `OPEN` element
 - `--mutation-config FILE`: JSON file with non-conforming mutation probabilities, optionally per type

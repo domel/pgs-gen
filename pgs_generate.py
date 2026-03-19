@@ -22,6 +22,8 @@ KEYWORDS = {
     "OPTIONAL",
 }
 
+GRAMMAR_SYMBOLS = frozenset("()[]{}:,|&?-;>")
+
 MUTATION_FIELDS = (
     "fresh_node_probability",
     "fresh_edge_probability",
@@ -43,10 +45,31 @@ class Token:
         self.pos = pos
 
 
+@dataclass(frozen=True)
+class TypeRef:
+    name: str
+
+
+def _validate_type_ref_prefix(prefix):
+    if prefix is None:
+        return None
+    if not prefix:
+        raise ValueError("type_ref_prefix must not be empty")
+    for ch in prefix:
+        if ch.isspace():
+            raise ValueError("type_ref_prefix must not contain whitespace")
+        if ch.isalnum() or ch in "_-" or ch in GRAMMAR_SYMBOLS:
+            raise ValueError(
+                "type_ref_prefix must use characters that are not identifiers or existing grammar symbols"
+            )
+    return prefix
+
+
 class Tokenizer:
-    def __init__(self, text):
+    def __init__(self, text, type_ref_prefix=None):
         self.text = text
         self.i = 0
+        self.type_ref_prefix = _validate_type_ref_prefix(type_ref_prefix)
 
     def _peek(self):
         if self.i >= len(self.text):
@@ -68,6 +91,14 @@ class Tokenizer:
         ch = self._peek()
         if not ch:
             return Token("EOF", "", pos)
+        if self.type_ref_prefix and self.text.startswith(self.type_ref_prefix, self.i):
+            self.i += len(self.type_ref_prefix)
+            if not self._peek() or not (self._peek().isalnum() or self._peek() in "_-"):
+                raise ValueError(f"Expected identifier after type reference prefix at {pos}")
+            start = self.i
+            while self._peek() and (self._peek().isalnum() or self._peek() in "_-"):
+                self.i += 1
+            return Token("TYPE_REF", self.text[start:self.i], pos)
         if ch == "-":
             nxt = self.text[self.i + 1] if self.i + 1 < len(self.text) else ""
             if not nxt or nxt.isspace() or nxt in "[](){}:,;>":
@@ -88,9 +119,9 @@ class Tokenizer:
 
 
 class Parser:
-    def __init__(self, text):
+    def __init__(self, text, type_ref_prefix=None):
         self.tokens = []
-        t = Tokenizer(text)
+        t = Tokenizer(text, type_ref_prefix=type_ref_prefix)
         while True:
             tok = t.next_token()
             self.tokens.append(tok)
@@ -349,6 +380,9 @@ class Parser:
         tok = self._peek()
         if self._match_sym(":"):
             tok = self._peek()
+            if tok.kind == "TYPE_REF":
+                self._next()
+                return TypeRef(tok.value)
             if self._is_name_token(tok):
                 return self._expect_name()
             raise ValueError(f"Expected label at {tok.pos}")
@@ -360,6 +394,9 @@ class Parser:
             inner = self._parse_label_spec()
             self._expect_sym("]")
             return inner
+        if tok.kind == "TYPE_REF":
+            self._next()
+            return TypeRef(tok.value)
         if self._is_name_token(tok):
             return self._expect_name()
         raise ValueError(f"Expected label at {tok.pos}")
@@ -510,8 +547,8 @@ class EdgeInstance:
         self.type_name = type_name
 
 
-def parse_schema(text):
-    parser = Parser(text)
+def parse_schema(text, type_ref_prefix=None):
+    parser = Parser(text, type_ref_prefix=type_ref_prefix)
     statements = parser.parse()
     node_types = {}
     edge_types = {}
@@ -535,6 +572,8 @@ def parse_schema(text):
 def eval_label_spec(ast, rng):
     if ast is None:
         return []
+    if isinstance(ast, TypeRef):
+        return [ast.name]
     if isinstance(ast, str):
         return [ast]
     kind = ast[0]
@@ -552,6 +591,8 @@ def eval_label_spec(ast, rng):
 def _label_spec_primary(ast):
     if ast is None:
         return None
+    if isinstance(ast, TypeRef):
+        return ast.name
     if isinstance(ast, str):
         return ast
     kind = ast[0]
@@ -582,6 +623,8 @@ def _canonical_prop_type(prop_type):
 def _collect_label_names(ast):
     if ast is None:
         return set()
+    if isinstance(ast, TypeRef):
+        return {ast.name}
     if isinstance(ast, str):
         return {ast}
     kind = ast[0]
@@ -843,6 +886,14 @@ class SchemaSemantics:
     def _eval_label_expr(self, ast, is_node, current_type=None):
         if ast is None:
             return [BaseOption(set(), _empty_record_spec(), False)]
+        if isinstance(ast, TypeRef):
+            if is_node:
+                if ast.name not in self.node_types:
+                    raise ValueError(f"Unknown node type reference: {ast.name}")
+                return self.eval_node_type(ast.name)
+            if ast.name not in self.edge_types:
+                raise ValueError(f"Unknown edge type reference: {ast.name}")
+            return [BaseOption({ast.name}, _empty_record_spec(), False)]
         if isinstance(ast, str):
             if is_node and ast in self.node_types and ast != current_type:
                 return self.eval_node_type(ast)
@@ -874,6 +925,10 @@ class SchemaSemantics:
         if ast is None:
             empty = BaseOption(set(), _empty_record_spec(), False)
             return [EdgeOption(empty, empty, empty)]
+        if isinstance(ast, TypeRef):
+            if ast.name not in self.edge_types:
+                raise ValueError(f"Unknown edge type reference: {ast.name}")
+            return self.eval_edge_type(ast.name)
         if isinstance(ast, str):
             if ast in self.edge_types and ast != current_type:
                 return self.eval_edge_type(ast)
@@ -1831,6 +1886,10 @@ def main(argv):
     parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
     parser.add_argument("-f", "--fake", action="store_true", help="Use faker for more realistic values")
     parser.add_argument(
+        "--type-ref-prefix",
+        help="Optional prefix that marks explicit type references in label expressions, for example '@' to allow @PersonType",
+    )
+    parser.add_argument(
         "--format",
         choices=["apoc", "graphml-tp", "graphson3", "oracle-graphson"],
         default="apoc",
@@ -1935,7 +1994,10 @@ def main(argv):
     with open(args.schema, "r", encoding="utf-8") as f:
         schema_text = f.read()
 
-    node_types, edge_types, graph_types = parse_schema(schema_text)
+    node_types, edge_types, graph_types = parse_schema(
+        schema_text,
+        type_ref_prefix=args.type_ref_prefix,
+    )
     if not graph_types:
         raise SystemExit("No GRAPH TYPE found in schema")
 
