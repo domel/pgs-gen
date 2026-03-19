@@ -78,9 +78,8 @@ class Tokenizer:
             while self._peek() and (self._peek().isalnum() or self._peek() in "_-"):
                 self.i += 1
             value = self.text[start:self.i]
-            upper = value.upper()
-            if upper in KEYWORDS:
-                return Token("KW", upper, pos)
+            if value.upper() in KEYWORDS:
+                return Token("KW", value, pos)
             return Token("IDENT", value, pos)
         if ch in "()[]{}:,|&?-;>" or ch == "-":
             self.i += 1
@@ -102,14 +101,35 @@ class Parser:
     def _peek(self):
         return self.tokens[self.i]
 
+    def _peek_ahead(self, offset):
+        idx = self.i + offset
+        if idx >= len(self.tokens):
+            return self.tokens[-1]
+        return self.tokens[idx]
+
     def _next(self):
         tok = self.tokens[self.i]
         self.i += 1
         return tok
 
+    def _is_kw(self, tok, value):
+        return tok.kind == "KW" and tok.value.upper() == value
+
+    def _is_name_token(self, tok, allow_open=True, allow_optional=True):
+        if tok.kind == "IDENT":
+            return True
+        if tok.kind != "KW":
+            return False
+        upper = tok.value.upper()
+        if upper == "OPEN" and not allow_open:
+            return False
+        if upper == "OPTIONAL" and not allow_optional:
+            return False
+        return True
+
     def _match_kw(self, value):
         tok = self._peek()
-        if tok.kind == "KW" and tok.value == value:
+        if self._is_kw(tok, value):
             self._next()
             return True
         return False
@@ -131,9 +151,9 @@ class Parser:
             tok = self._peek()
             raise ValueError(f"Expected symbol '{value}' at {tok.pos}")
 
-    def _expect_ident(self):
+    def _expect_name(self, allow_open=True, allow_optional=True):
         tok = self._peek()
-        if tok.kind == "IDENT":
+        if self._is_name_token(tok, allow_open=allow_open, allow_optional=allow_optional):
             self._next()
             return tok.value
         raise ValueError(f"Expected identifier at {tok.pos}")
@@ -169,7 +189,7 @@ class Parser:
         raise ValueError(f"Expected NODE/EDGE/GRAPH at {tok.pos}")
 
     def _parse_graph_type(self):
-        name = self._expect_ident()
+        name = self._expect_name()
         if self._match_kw("STRICT"):
             form = "STRICT"
         elif self._match_kw("LOOSE"):
@@ -182,7 +202,7 @@ class Parser:
 
     def _parse_graph_def(self):
         if self._match_kw("IMPORTS"):
-            _ = self._expect_ident()
+            _ = self._expect_name()
         self._expect_sym("{")
         elements = []
         if not self._match_sym("}"):
@@ -200,17 +220,17 @@ class Parser:
             next_tok = self._peek()
             # restore by moving back
             self.i -= 1
-            if next_tok.kind == "IDENT":
+            if self._is_name_token(next_tok, allow_open=False):
                 return self._parse_node_type()
             return self._parse_edge_type()
-        if tok.kind == "IDENT":
-            name = self._expect_ident()
+        if self._is_name_token(tok):
+            name = self._expect_name()
             return name
         raise ValueError(f"Unexpected element type at {tok.pos}")
 
     def _parse_node_type(self, abstract=False):
         self._expect_sym("(")
-        name = self._expect_ident()
+        name = self._expect_name()
         spec = self._parse_label_property_spec()
         self._expect_sym(")")
         return NodeType(name, spec, abstract)
@@ -234,8 +254,8 @@ class Parser:
     def _parse_middle_type(self):
         self._expect_sym("[")
         name = None
-        if self._peek().kind == "IDENT":
-            name = self._expect_ident()
+        if self._is_name_token(self._peek(), allow_open=False):
+            name = self._expect_name(allow_open=False)
         spec = self._parse_label_property_spec()
         self._expect_sym("]")
         return name, spec
@@ -264,7 +284,8 @@ class Parser:
                 return LabelPropSpec(
                     labels_ast, label_open, props, prop_open, label_spec_present, prop_spec_present
                 )
-            if self._match_kw("OPEN"):
+            if self._is_kw(self._peek(), "OPEN") and self._peek_ahead(1).kind == "SYM" and self._peek_ahead(1).value == "}":
+                self._next()
                 prop_open = True
                 self._expect_sym("}")
                 return LabelPropSpec(
@@ -283,8 +304,13 @@ class Parser:
         props = []
         props.append(self._parse_property())
         while self._peek().kind == "SYM" and self._peek().value == ",":
-            next_tok = self.tokens[self.i + 1] if self.i + 1 < len(self.tokens) else None
-            if next_tok and next_tok.kind == "KW" and next_tok.value == "OPEN":
+            next_tok = self._peek_ahead(1)
+            after_next = self._peek_ahead(2)
+            if (
+                self._is_kw(next_tok, "OPEN")
+                and after_next.kind == "SYM"
+                and after_next.value == "}"
+            ):
                 break
             self._match_sym(",")
             props.append(self._parse_property())
@@ -292,8 +318,8 @@ class Parser:
 
     def _parse_property(self):
         optional = self._match_kw("OPTIONAL")
-        key = self._expect_ident()
-        prop_type = self._expect_ident()
+        key = self._expect_name()
+        prop_type = self._expect_name()
         return Property(key, prop_type, optional)
 
     def _parse_label_spec(self):
@@ -323,8 +349,8 @@ class Parser:
         tok = self._peek()
         if self._match_sym(":"):
             tok = self._peek()
-            if tok.kind == "IDENT":
-                return self._expect_ident()
+            if self._is_name_token(tok):
+                return self._expect_name()
             raise ValueError(f"Expected label at {tok.pos}")
         if self._match_sym("("):
             inner = self._parse_label_spec()
@@ -334,8 +360,8 @@ class Parser:
             inner = self._parse_label_spec()
             self._expect_sym("]")
             return inner
-        if tok.kind == "IDENT":
-            return self._expect_ident()
+        if self._is_name_token(tok):
+            return self._expect_name()
         raise ValueError(f"Expected label at {tok.pos}")
 
 

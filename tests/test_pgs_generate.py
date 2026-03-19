@@ -26,6 +26,17 @@ CREATE GRAPH TYPE G STRICT {
 };
 """
 
+KEYWORD_PROPERTY_SCHEMA = """
+CREATE NODE TYPE
+( EntityType : Entity {
+  OPTIONAL type String
+} );
+
+CREATE GRAPH TYPE ICIJ LOOSE {
+  EntityType
+};
+"""
+
 
 def _load_schema(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -206,6 +217,28 @@ def test_property_types_match_schema():
     _assert_property_types("examples/CatalogGraphType.pgs", 11)
     _assert_property_types("examples/FraudGraphType.pgs", 13)
     _assert_property_types("examples/star-wars_pgschema.pgs", 17)
+
+
+def test_keyword_property_name_parses_and_generates():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(KEYWORD_PROPERTY_SCHEMA)
+
+    entity_type = node_types["EntityType"]
+    assert len(entity_type.spec.properties) == 1
+    assert entity_type.spec.properties[0].name == "type"
+    assert entity_type.spec.properties[0].prop_type == "String"
+    assert entity_type.spec.properties[0].optional is True
+
+    semantics = pgs_generate.SchemaSemantics(node_types, edge_types)
+    options = semantics.eval_node_type("EntityType")
+    assert len(options) == 1
+    assert options[0].record_spec.optional == {"type": "STRING"}
+
+    rng = pgs_generate.random.Random(23)
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_types[0], node_types, edge_types, 1, rng
+    )
+    assert nodes
+    assert not edges
 
 
 def test_fake_value_formats():
