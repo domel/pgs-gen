@@ -47,6 +47,15 @@ CREATE GRAPH TYPE G STRICT {
 };
 """
 
+APOC_TYPED_GRAPHML_SCHEMA = """
+CREATE NODE TYPE
+(testNodeType : LabelOne {propkeyInteger INT, propKeyLong LONG, propKeyDouble DOUBLE, propKeyBoolean BOOLEAN });
+
+CREATE GRAPH TYPE testGraphType STRICT {
+    testNodeType
+}
+"""
+
 
 def _load_schema(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -547,6 +556,41 @@ def test_graphml_tinkerpop_format():
     data_label = node.find("g:data[@key='labelV']", ns)
     assert data_label is not None
     assert data_label.text
+
+
+def test_apoc_graphml_declares_property_types():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(APOC_TYPED_GRAPHML_SCHEMA)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(41)
+
+    nodes, edges, node_prop_names, edge_prop_names = pgs_generate.generate_instances(
+        graph_type, node_types, edge_types, 1, rng
+    )
+    tree = pgs_generate.build_graphml(nodes, edges, node_prop_names, edge_prop_names)
+    root = tree.getroot()
+    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
+
+    node_keys = {
+        key_el.attrib["attr.name"]: key_el.attrib.get("attr.type")
+        for key_el in root.findall("g:key[@for='node']", ns)
+    }
+    edge_keys = {
+        key_el.attrib["attr.name"]: key_el.attrib.get("attr.type")
+        for key_el in root.findall("g:key[@for='edge']", ns)
+    }
+
+    assert node_keys["labels"] == "string"
+    assert node_keys["propkeyInteger"] in {"int", "long"}
+    assert node_keys["propKeyLong"] in {"int", "long"}
+    assert node_keys["propKeyDouble"] == "double"
+    assert node_keys["propKeyBoolean"] == "boolean"
+    assert edge_keys["label"] == "string"
+
+    graph = root.find("g:graph", ns)
+    node = graph.find("g:node", ns)
+    bool_data = node.find("g:data[@key='propKeyBoolean']", ns)
+    assert bool_data is not None
+    assert bool_data.text in {"true", "false"}
 
 
 def test_graphml_tinkerpop_labels_property():

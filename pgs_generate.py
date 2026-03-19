@@ -1644,6 +1644,15 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
     if edge_has_labels:
         key_ids[("edge", "labels")] = "labels" if ("node", "labels") not in key_ids else "e_labels"
 
+    node_values = {}
+    edge_values = {}
+    for node in nodes:
+        for key, value in node.props.items():
+            node_values.setdefault(key, []).append(value)
+    for edge in edges:
+        for key, value in edge.props.items():
+            edge_values.setdefault(key, []).append(value)
+
     for name in sorted(node_prop_names):
         key_ids[("node", name)] = name
     for name in sorted(edge_prop_names):
@@ -1656,24 +1665,34 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
         ET.SubElement(
             root,
             f"{{{ns}}}key",
-            {"id": key_ids[("node", name)], "for": "node", "attr.name": name},
+            {
+                "id": key_ids[("node", name)],
+                "for": "node",
+                "attr.name": name,
+                "attr.type": "string" if name == "labels" else _infer_graphml_type(node_values[name]),
+            },
         )
     ET.SubElement(
         root,
         f"{{{ns}}}key",
-        {"id": key_ids[("edge", "label")], "for": "edge", "attr.name": "label"},
+        {"id": key_ids[("edge", "label")], "for": "edge", "attr.name": "label", "attr.type": "string"},
     )
     if edge_has_labels:
         ET.SubElement(
             root,
             f"{{{ns}}}key",
-            {"id": key_ids[("edge", "labels")], "for": "edge", "attr.name": "labels"},
+            {"id": key_ids[("edge", "labels")], "for": "edge", "attr.name": "labels", "attr.type": "string"},
         )
     for name in sorted(edge_prop_names):
         ET.SubElement(
             root,
             f"{{{ns}}}key",
-            {"id": key_ids[("edge", name)], "for": "edge", "attr.name": name},
+            {
+                "id": key_ids[("edge", name)],
+                "for": "edge",
+                "attr.name": name,
+                "attr.type": _infer_graphml_type(edge_values[name]),
+            },
         )
 
     graph = ET.SubElement(root, f"{{{ns}}}graph", {"id": "G", "edgedefault": "directed"})
@@ -1685,7 +1704,7 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
         data_labels.text = label_str
         for key, value in node.props.items():
             data_el = ET.SubElement(node_el, f"{{{ns}}}data", {"key": key_ids[("node", key)]})
-            data_el.text = str(value)
+            data_el.text = _graphml_value_text(value)
 
     for edge in edges:
         label_str = ":" + ":".join(edge.labels) if edge.labels else ""
@@ -1702,7 +1721,7 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
             data_labels.text = label_str
         for key, value in edge.props.items():
             data_el = ET.SubElement(edge_el, f"{{{ns}}}data", {"key": key_ids[("edge", key)]})
-            data_el.text = str(value)
+            data_el.text = _graphml_value_text(value)
 
     return ET.ElementTree(root)
 
@@ -1723,6 +1742,12 @@ def _infer_graphml_type(values):
     if has_bool:
         return "boolean"
     return "string"
+
+
+def _graphml_value_text(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def build_graphml_tinkerpop(nodes, edges, include_labels_prop=False):
@@ -1787,7 +1812,7 @@ def build_graphml_tinkerpop(nodes, edges, include_labels_prop=False):
         data_label.text = label
         for key, value in node.props.items():
             data_el = ET.SubElement(node_el, f"{{{ns}}}data", {"key": key})
-            data_el.text = str(value)
+            data_el.text = _graphml_value_text(value)
         if include_labels_prop and len(node.labels) > 1:
             data_labels = ET.SubElement(node_el, f"{{{ns}}}data", {"key": labels_prop_node})
             data_labels.text = ":".join(node.labels)
@@ -1803,7 +1828,7 @@ def build_graphml_tinkerpop(nodes, edges, include_labels_prop=False):
         data_label.text = label
         for key, value in edge.props.items():
             data_el = ET.SubElement(edge_el, f"{{{ns}}}data", {"key": key})
-            data_el.text = str(value)
+            data_el.text = _graphml_value_text(value)
         if include_labels_prop and len(edge.labels) > 1:
             data_labels = ET.SubElement(edge_el, f"{{{ns}}}data", {"key": labels_prop_edge})
             data_labels.text = ":".join(edge.labels)
