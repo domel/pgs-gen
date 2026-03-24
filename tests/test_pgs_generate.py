@@ -49,10 +49,32 @@ CREATE GRAPH TYPE G STRICT {
 
 APOC_TYPED_GRAPHML_SCHEMA = """
 CREATE NODE TYPE
-(testNodeType : LabelOne {propkeyInteger INT, propKeyLong LONG, propKeyDouble DOUBLE, propKeyBoolean BOOLEAN });
+(testNodeType : LabelOne {
+  propkeyInteger INT,
+  propKeyLong LONG,
+  propKeyDouble DOUBLE,
+  propKeyBoolean BOOLEAN,
+  propKeyList LIST<STRING>
+});
 
 CREATE GRAPH TYPE testGraphType STRICT {
     testNodeType
+}
+"""
+
+LIST_PROPERTY_SCHEMA = """
+CREATE NODE TYPE
+(ListNodeType : SomeLabel {
+  propKeyStrings LIST<STRING>,
+  propKeyInts LIST<LONG>,
+  propKeyFloats LIST<DOUBLE>,
+  propKeyBooleans LIST<BOOLEAN>,
+  propKeyDates LIST<DATE>,
+  propKeyDatetimes LIST<TIMESTAMP>
+});
+
+CREATE GRAPH TYPE testGraphType STRICT {
+    ListNodeType
 }
 """
 
@@ -63,6 +85,9 @@ def _load_schema(path):
 
 
 def _is_value_of_type(value, prop_type):
+    inner_type = pgs_generate._list_inner_prop_type(prop_type)
+    if inner_type is not None:
+        return isinstance(value, list) and all(_is_value_of_type(item, inner_type) for item in value)
     t = prop_type.upper()
     if t in {"INT", "INT32", "INT64", "LONG"}:
         if isinstance(value, bool):
@@ -260,6 +285,51 @@ def test_keyword_property_name_parses_and_generates():
     assert not edges
 
 
+def test_list_property_types_parse_and_generate():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(LIST_PROPERTY_SCHEMA)
+
+    list_node = node_types["ListNodeType"]
+    prop_types = {prop.name: prop.prop_type for prop in list_node.spec.properties}
+    assert prop_types == {
+        "propKeyStrings": "LIST<STRING>",
+        "propKeyInts": "LIST<INT>",
+        "propKeyFloats": "LIST<FLOAT>",
+        "propKeyBooleans": "LIST<BOOLEAN>",
+        "propKeyDates": "LIST<DATE>",
+        "propKeyDatetimes": "LIST<DATETIME>",
+    }
+
+    semantics = pgs_generate.SchemaSemantics(node_types, edge_types)
+    options = semantics.eval_node_type("ListNodeType")
+    assert len(options) == 1
+    assert options[0].record_spec.required == prop_types
+
+    rng = pgs_generate.random.Random(29)
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_types[0], node_types, edge_types, 1, rng
+    )
+
+    assert nodes
+    assert not edges
+    for node in nodes:
+        for key, prop_type in prop_types.items():
+            assert key in node.props
+            assert isinstance(node.props[key], list)
+            assert node.props[key]
+            assert _is_value_of_type(node.props[key], prop_type)
+
+
+def test_list_property_rejects_unknown_item_type():
+    schema = """
+    CREATE GRAPH TYPE G STRICT {
+      (N: Person {tags LIST<UUID>})
+    };
+    """
+
+    with pytest.raises(ValueError, match="Unsupported LIST item type UUID"):
+        pgs_generate.parse_schema(schema)
+
+
 def test_type_ref_prefix_parses_and_generates():
     node_types, edge_types, graph_types = pgs_generate.parse_schema(
         TYPE_REF_SCHEMA,
@@ -380,7 +450,7 @@ def test_cli_open_extra_generates_graphml(tmp_path):
     schema_path = tmp_path / "schema.pgs"
     schema_path.write_text(schema, encoding="utf-8")
     out_path = tmp_path / "out.graphml"
-    result = subprocess.run(
+    subprocess.run(
         [
             sys.executable,
             "pgs_generate.py",
@@ -570,10 +640,11 @@ def test_apoc_graphml_declares_property_types():
     root = tree.getroot()
     ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
 
+    node_key_elements = root.findall("g:key[@for='node']", ns)
     node_keys = {
-        key_el.attrib["attr.name"]: key_el.attrib.get("attr.type")
-        for key_el in root.findall("g:key[@for='node']", ns)
+        key_el.attrib["attr.name"]: key_el.attrib.get("attr.type") for key_el in node_key_elements
     }
+    node_key_ids = {key_el.attrib["attr.name"]: key_el.attrib["id"] for key_el in node_key_elements}
     edge_keys = {
         key_el.attrib["attr.name"]: key_el.attrib.get("attr.type")
         for key_el in root.findall("g:key[@for='edge']", ns)
@@ -584,6 +655,7 @@ def test_apoc_graphml_declares_property_types():
     assert node_keys["propKeyLong"] in {"int", "long"}
     assert node_keys["propKeyDouble"] == "double"
     assert node_keys["propKeyBoolean"] == "boolean"
+    assert node_keys["propKeyList"] == "string"
     assert edge_keys["label"] == "string"
 
     graph = root.find("g:graph", ns)
@@ -591,6 +663,9 @@ def test_apoc_graphml_declares_property_types():
     bool_data = node.find("g:data[@key='propKeyBoolean']", ns)
     assert bool_data is not None
     assert bool_data.text in {"true", "false"}
+    list_data = node.find(f"g:data[@key='{node_key_ids['propKeyList']}']", ns)
+    assert list_data is not None
+    assert json.loads(list_data.text) == nodes[0].props["propKeyList"]
 
 
 def test_graphml_tinkerpop_labels_property():

@@ -22,7 +22,18 @@ KEYWORDS = {
     "OPTIONAL",
 }
 
-GRAMMAR_SYMBOLS = frozenset("()[]{}:,|&?-;>")
+GRAMMAR_SYMBOLS = frozenset("()[]{}:,|&?-;<>")
+
+SUPPORTED_SCALAR_PROP_TYPES = frozenset(
+    {
+        "INT",
+        "FLOAT",
+        "BOOLEAN",
+        "DATE",
+        "DATETIME",
+        "STRING",
+    }
+)
 
 MUTATION_FIELDS = (
     "fresh_node_probability",
@@ -112,7 +123,7 @@ class Tokenizer:
             if value.upper() in KEYWORDS:
                 return Token("KW", value, pos)
             return Token("IDENT", value, pos)
-        if ch in "()[]{}:,|&?-;>" or ch == "-":
+        if ch in "()[]{}:,|&?-;<>" or ch == "-":
             self.i += 1
             return Token("SYM", ch, pos)
         raise ValueError(f"Unexpected character '{ch}' at {pos}")
@@ -350,8 +361,20 @@ class Parser:
     def _parse_property(self):
         optional = self._match_kw("OPTIONAL")
         key = self._expect_name()
-        prop_type = self._expect_name()
+        prop_type = self._parse_property_type()
         return Property(key, prop_type, optional)
+
+    def _parse_property_type(self):
+        prop_type = self._expect_name()
+        if prop_type.upper() != "LIST" or not self._match_sym("<"):
+            return prop_type
+        inner_type = self._expect_name(allow_open=False, allow_optional=False)
+        inner_canon = _canonical_scalar_prop_type(inner_type)
+        if inner_canon not in SUPPORTED_SCALAR_PROP_TYPES:
+            tok = self._peek()
+            raise ValueError(f"Unsupported LIST item type {inner_type} at {tok.pos}")
+        self._expect_sym(">")
+        return f"LIST<{inner_canon}>"
 
     def _parse_label_spec(self):
         return self._parse_label_or()
@@ -603,7 +626,7 @@ def _label_spec_primary(ast):
     return None
 
 
-def _canonical_prop_type(prop_type):
+def _canonical_scalar_prop_type(prop_type):
     t = prop_type.strip().upper()
     if t in {"INT32", "INT64", "INT", "LONG"}:
         return "INT"
@@ -618,6 +641,26 @@ def _canonical_prop_type(prop_type):
     if t == "STRING":
         return "STRING"
     return t
+
+
+def _list_inner_prop_type(prop_type):
+    t = prop_type.strip()
+    if not t.upper().startswith("LIST<") or not t.endswith(">"):
+        return None
+    inner = t[5:-1].strip()
+    if not inner:
+        return None
+    canon = _canonical_scalar_prop_type(inner)
+    if canon not in SUPPORTED_SCALAR_PROP_TYPES:
+        return None
+    return canon
+
+
+def _canonical_prop_type(prop_type):
+    inner = _list_inner_prop_type(prop_type)
+    if inner is not None:
+        return f"LIST<{inner}>"
+    return _canonical_scalar_prop_type(prop_type)
 
 
 def _collect_label_names(ast):
@@ -751,6 +794,9 @@ def _combine_base_options(left, right):
 
 
 def _value_conforms(value, prop_type):
+    inner_type = _list_inner_prop_type(prop_type)
+    if inner_type is not None:
+        return isinstance(value, list) and all(_value_conforms(item, inner_type) for item in value)
     t = _canonical_prop_type(prop_type)
     if t == "INT":
         if isinstance(value, bool):
@@ -1039,6 +1085,13 @@ def _fake_string(prop_name, faker, scale_factor):
 
 
 def generate_value(prop_type, rng, scale_factor, idx, prop_name, faker=None):
+    inner_type = _list_inner_prop_type(prop_type)
+    if inner_type is not None:
+        list_len = rng.randint(1, 4)
+        return [
+            generate_value(inner_type, rng, scale_factor, idx + item_idx, f"{prop_name}_{item_idx}", faker)
+            for item_idx in range(list_len)
+        ]
     t = prop_type.upper()
     if t in {"INT", "INT32", "INT64", "LONG"}:
         if faker:
@@ -1076,6 +1129,8 @@ def generate_value(prop_type, rng, scale_factor, idx, prop_name, faker=None):
 
 
 def generate_invalid_value(prop_type, rng, scale_factor, idx, prop_name, faker=None):
+    if _list_inner_prop_type(prop_type) is not None:
+        return f"invalid_{prop_name}_{idx}"
     t = _canonical_prop_type(prop_type)
     if t in {"INT", "FLOAT", "BOOLEAN"}:
         return f"invalid_{prop_name}_{idx}"
@@ -1727,6 +1782,8 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
 
 
 def _infer_graphml_type(values):
+    if any(isinstance(value, list) for value in values):
+        return "string"
     has_string = any(isinstance(value, str) for value in values)
     has_bool = any(isinstance(value, bool) for value in values)
     has_float = any(isinstance(value, float) for value in values)
@@ -1745,6 +1802,8 @@ def _infer_graphml_type(values):
 
 
 def _graphml_value_text(value):
+    if isinstance(value, list):
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
