@@ -48,6 +48,8 @@ MUTATION_FIELDS = (
     "typo_property_key_probability",
 )
 
+PGS_GRAPHML_NS = "https://github.com/domel/pgs-gen/ns/graphml"
+
 
 class Token:
     def __init__(self, kind, value, pos):
@@ -551,23 +553,47 @@ class MutationReport:
 
 
 class NodeInstance:
-    def __init__(self, node_id, labels, props, type_name, schema_labels=None, schema_props=None):
+    def __init__(
+        self,
+        node_id,
+        labels,
+        props,
+        type_name,
+        schema_labels=None,
+        schema_props=None,
+        schema_prop_types=None,
+    ):
         self.node_id = node_id
         self.labels = labels
         self.props = props
         self.type_name = type_name
         self.schema_labels = list(schema_labels) if schema_labels is not None else list(labels)
         self.schema_props = dict(schema_props) if schema_props is not None else dict(props)
+        self.schema_prop_types = (
+            dict(schema_prop_types) if schema_prop_types is not None else {}
+        )
 
 
 class EdgeInstance:
-    def __init__(self, edge_id, source, target, labels, props, type_name):
+    def __init__(
+        self,
+        edge_id,
+        source,
+        target,
+        labels,
+        props,
+        type_name,
+        schema_prop_types=None,
+    ):
         self.edge_id = edge_id
         self.source = source
         self.target = target
         self.labels = labels
         self.props = props
         self.type_name = type_name
+        self.schema_prop_types = (
+            dict(schema_prop_types) if schema_prop_types is not None else {}
+        )
 
 
 def parse_schema(text, type_ref_prefix=None):
@@ -784,6 +810,13 @@ def _combine_record_specs(left, right):
         else:
             optional[key] = prop_type
     return RecordSpec(required, optional, left.open or right.open)
+
+
+def _record_spec_prop_types(record_spec):
+    prop_types = {}
+    prop_types.update(record_spec.required)
+    prop_types.update(record_spec.optional)
+    return prop_types
 
 
 def _combine_base_options(left, right):
@@ -1547,6 +1580,7 @@ def generate_instances(
             props = _generate_record(option.record_spec, len(nodes))
             schema_labels = list(labels)
             schema_props = dict(props)
+            schema_prop_types = _record_spec_prop_types(option.record_spec)
             labels, props, mutations = _apply_nonconforming_mutations(
                 labels,
                 props,
@@ -1567,6 +1601,7 @@ def generate_instances(
                     node_type.name,
                     schema_labels=schema_labels,
                     schema_props=schema_props,
+                    schema_prop_types=schema_prop_types,
                 )
             )
             if mutation_report is not None:
@@ -1634,6 +1669,7 @@ def generate_instances(
                     if extra:
                         labels.append(extra)
             props = _generate_record(opt.edge.record_spec, len(edges))
+            schema_prop_types = _record_spec_prop_types(opt.edge.record_spec)
             labels, props, mutations = _apply_nonconforming_mutations(
                 labels,
                 props,
@@ -1647,7 +1683,15 @@ def generate_instances(
             )
             edge_id = f"e{len(edges)}"
             edges.append(
-                EdgeInstance(edge_id, source.node_id, target.node_id, labels, props, edge_type.name)
+                EdgeInstance(
+                    edge_id,
+                    source.node_id,
+                    target.node_id,
+                    labels,
+                    props,
+                    edge_type.name,
+                    schema_prop_types=schema_prop_types,
+                )
             )
             if mutation_report is not None:
                 mutation_report.record_object_mutations(
@@ -1680,13 +1724,81 @@ def generate_instances(
     return nodes, edges, node_prop_names, edge_prop_names
 
 
-def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
+def _graphml_declared_scalar_type(prop_type):
+    t = _canonical_scalar_prop_type(prop_type)
+    if t == "INT":
+        return "int"
+    if t == "FLOAT":
+        return "double"
+    if t == "BOOLEAN":
+        return "boolean"
+    return "string"
+
+
+def _graphml_list_metadata_type(prop_type):
+    inner_type = _list_inner_prop_type(prop_type)
+    if inner_type is None:
+        return None
+    return inner_type.lower()
+
+
+def _graphml_apoc_list_type(prop_type):
+    inner_type = _list_inner_prop_type(prop_type)
+    if inner_type is None:
+        return None
+    return _graphml_declared_scalar_type(inner_type)
+
+
+def _graphml_declared_type(values, schema_prop_type=None):
+    if schema_prop_type is None:
+        return _infer_graphml_type(values)
+    if _list_inner_prop_type(schema_prop_type) is not None:
+        return "string"
+    return _graphml_declared_scalar_type(schema_prop_type)
+
+
+def _merge_schema_prop_types(instances):
+    prop_types = {}
+    conflicts = set()
+    for instance in instances:
+        for key, prop_type in getattr(instance, "schema_prop_types", {}).items():
+            canon = _canonical_prop_type(prop_type)
+            existing = prop_types.get(key)
+            if existing is None:
+                prop_types[key] = canon
+            elif existing != canon:
+                conflicts.add(key)
+    for key in conflicts:
+        prop_types.pop(key, None)
+    return prop_types
+
+
+def _graphml_key_attrs(key_id, owner, name, values, schema_prop_type=None, neo4j_compat=False):
+    attrs = {
+        "id": key_id,
+        "for": owner,
+        "attr.name": name,
+        "attr.type": _graphml_declared_type(values, schema_prop_type=schema_prop_type),
+    }
+    list_type = _list_inner_prop_type(schema_prop_type) if schema_prop_type else None
+    if list_type is not None:
+        attrs["attr.type"] = "string"
+        if neo4j_compat:
+            attrs["attr.list"] = _graphml_apoc_list_type(schema_prop_type)
+        else:
+            attrs[f"{{{PGS_GRAPHML_NS}}}list"] = _graphml_list_metadata_type(schema_prop_type)
+    return attrs
+
+
+def build_graphml(nodes, edges, node_prop_names, edge_prop_names, neo4j_compat=False):
     edge_has_labels = any(len(edge.labels) > 1 for edge in edges)
 
     ns = "http://graphml.graphdrawing.org/xmlns"
     xsi = "http://www.w3.org/2001/XMLSchema-instance"
     ET.register_namespace("", ns)
     ET.register_namespace("xsi", xsi)
+    if not neo4j_compat:
+        ET.register_namespace("pgs", PGS_GRAPHML_NS)
     root = ET.Element(
         f"{{{ns}}}graphml",
         {f"{{{xsi}}}schemaLocation": f"{ns} {ns}/1.0/graphml.xsd"},
@@ -1701,6 +1813,8 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
 
     node_values = {}
     edge_values = {}
+    node_schema_prop_types = _merge_schema_prop_types(nodes)
+    edge_schema_prop_types = _merge_schema_prop_types(edges)
     for node in nodes:
         for key, value in node.props.items():
             node_values.setdefault(key, []).append(value)
@@ -1717,16 +1831,22 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
             key_ids[("edge", name)] = name
 
     for name in ["labels"] + sorted(node_prop_names):
-        ET.SubElement(
-            root,
-            f"{{{ns}}}key",
-            {
-                "id": key_ids[("node", name)],
-                "for": "node",
-                "attr.name": name,
-                "attr.type": "string" if name == "labels" else _infer_graphml_type(node_values[name]),
-            },
-        )
+        attrs = {
+            "id": key_ids[("node", name)],
+            "for": "node",
+            "attr.name": name,
+            "attr.type": "string",
+        }
+        if name != "labels":
+            attrs = _graphml_key_attrs(
+                key_ids[("node", name)],
+                "node",
+                name,
+                node_values.get(name, []),
+                schema_prop_type=node_schema_prop_types.get(name),
+                neo4j_compat=neo4j_compat,
+            )
+        ET.SubElement(root, f"{{{ns}}}key", attrs)
     ET.SubElement(
         root,
         f"{{{ns}}}key",
@@ -1742,19 +1862,24 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
         ET.SubElement(
             root,
             f"{{{ns}}}key",
-            {
-                "id": key_ids[("edge", name)],
-                "for": "edge",
-                "attr.name": name,
-                "attr.type": _infer_graphml_type(edge_values[name]),
-            },
+            _graphml_key_attrs(
+                key_ids[("edge", name)],
+                "edge",
+                name,
+                edge_values.get(name, []),
+                schema_prop_type=edge_schema_prop_types.get(name),
+                neo4j_compat=neo4j_compat,
+            ),
         )
 
     graph = ET.SubElement(root, f"{{{ns}}}graph", {"id": "G", "edgedefault": "directed"})
 
     for node in nodes:
         label_str = ":" + ":".join(node.labels) if node.labels else ""
-        node_el = ET.SubElement(graph, f"{{{ns}}}node", {"id": node.node_id, "labels": label_str})
+        node_attrs = {"id": node.node_id}
+        if neo4j_compat:
+            node_attrs["labels"] = label_str
+        node_el = ET.SubElement(graph, f"{{{ns}}}node", node_attrs)
         data_labels = ET.SubElement(node_el, f"{{{ns}}}data", {"key": key_ids[("node", "labels")]})
         data_labels.text = label_str
         for key, value in node.props.items():
@@ -1764,11 +1889,10 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
     for edge in edges:
         label_str = ":" + ":".join(edge.labels) if edge.labels else ""
         primary_label = edge.labels[0] if edge.labels else ""
-        edge_el = ET.SubElement(
-            graph,
-            f"{{{ns}}}edge",
-            {"id": edge.edge_id, "source": edge.source, "target": edge.target, "label": primary_label},
-        )
+        edge_attrs = {"id": edge.edge_id, "source": edge.source, "target": edge.target}
+        if neo4j_compat:
+            edge_attrs["label"] = primary_label
+        edge_el = ET.SubElement(graph, f"{{{ns}}}edge", edge_attrs)
         data_label = ET.SubElement(edge_el, f"{{{ns}}}data", {"key": key_ids[("edge", "label")]})
         data_label.text = primary_label
         if edge_has_labels:
@@ -1779,6 +1903,16 @@ def build_graphml(nodes, edges, node_prop_names, edge_prop_names):
             data_el.text = _graphml_value_text(value)
 
     return ET.ElementTree(root)
+
+
+def build_graphml_apoc(nodes, edges, node_prop_names, edge_prop_names):
+    return build_graphml(
+        nodes,
+        edges,
+        node_prop_names,
+        edge_prop_names,
+        neo4j_compat=True,
+    )
 
 
 def _infer_graphml_type(values):
@@ -1975,9 +2109,9 @@ def main(argv):
     )
     parser.add_argument(
         "--format",
-        choices=["apoc", "graphml-tp", "graphson3", "oracle-graphson"],
-        default="apoc",
-        help="Output format: apoc (Neo4j GraphML), graphml-tp (TinkerPop GraphML), graphson3 (GraphSON 3.0 without embedded types), oracle-graphson (Oracle Property Graph GraphSON)",
+        choices=["graphml", "graphml-apoc", "apoc", "graphml-tp", "graphson3", "oracle-graphson"],
+        default="graphml",
+        help="Output format: graphml (standards-compliant GraphML with pgs:list metadata), graphml-apoc/apoc (Neo4j APOC-compatible GraphML with attr.list), graphml-tp (TinkerPop GraphML), graphson3 (GraphSON 3.0 without embedded types), oracle-graphson (Oracle Property Graph GraphSON)",
     )
     parser.add_argument(
         "--tp-labels-prop",
@@ -2150,6 +2284,9 @@ def main(argv):
         write_oracle_graphson(nodes, edges, out_path)
     elif args.format == "graphml-tp":
         tree = build_graphml_tinkerpop(nodes, edges, include_labels_prop=args.tp_labels_prop)
+        tree.write(out_path, encoding="utf-8", xml_declaration=True)
+    elif args.format in {"graphml-apoc", "apoc"}:
+        tree = build_graphml_apoc(nodes, edges, node_prop_names, edge_prop_names)
         tree.write(out_path, encoding="utf-8", xml_declaration=True)
     else:
         tree = build_graphml(nodes, edges, node_prop_names, edge_prop_names)

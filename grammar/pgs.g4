@@ -65,11 +65,15 @@ properties : property ( SP? ',' SP? property )* ;
 property : (OPTIONAL SP)? key SP propertyType SP? ;
 
 propertyType
-    : StringLiteral
-    | LIST SP? '<' SP? simplePropertyType SP? '>'
+    : scalarPropertyType
+    | listPropertyType
     ;
 
-simplePropertyType : StringLiteral ;
+listPropertyType
+    : LIST SP? '<' SP? scalarPropertyType SP? '>'
+    ;
+
+scalarPropertyType : StringLiteral ;
 
 key : StringLiteral ;
 
