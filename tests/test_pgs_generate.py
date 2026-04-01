@@ -49,12 +49,37 @@ CREATE GRAPH TYPE G STRICT {
 
 APOC_TYPED_GRAPHML_SCHEMA = """
 CREATE NODE TYPE
-(testNodeType : LabelOne {propkeyInteger INT, propKeyLong LONG, propKeyDouble DOUBLE, propKeyBoolean BOOLEAN });
+(testNodeType : LabelOne {
+  propkeyInteger INT,
+  propKeyLong LONG,
+  propKeyDouble DOUBLE,
+  propKeyBoolean BOOLEAN,
+  propKeyList LIST<STRING>
+});
 
 CREATE GRAPH TYPE testGraphType STRICT {
     testNodeType
 }
 """
+
+LIST_PROPERTY_SCHEMA = """
+CREATE NODE TYPE
+(ListNodeType : SomeLabel {
+  propKeyStrings LIST<STRING>,
+  propKeyInts LIST<LONG>,
+  propKeyFloats LIST<DOUBLE>,
+  propKeyBooleans LIST<BOOLEAN>,
+  propKeyDates LIST<DATE>,
+  propKeyDatetimes LIST<TIMESTAMP>
+});
+
+CREATE GRAPH TYPE testGraphType STRICT {
+    ListNodeType
+}
+"""
+
+
+GRAPHML_NS = {"g": "http://graphml.graphdrawing.org/xmlns"}
 
 
 def _load_schema(path):
@@ -62,7 +87,24 @@ def _load_schema(path):
         return f.read()
 
 
+def _graphml_key_names(root):
+    return {
+        key_el.attrib["id"]: key_el.attrib.get("attr.name", "")
+        for key_el in root.findall("g:key", GRAPHML_NS)
+    }
+
+
+def _graphml_data_text(element, key_names, attr_name):
+    for data in element.findall("g:data", GRAPHML_NS):
+        if key_names.get(data.attrib.get("key", "")) == attr_name:
+            return data.text or ""
+    return ""
+
+
 def _is_value_of_type(value, prop_type):
+    inner_type = pgs_generate._list_inner_prop_type(prop_type)
+    if inner_type is not None:
+        return isinstance(value, list) and all(_is_value_of_type(item, inner_type) for item in value)
     t = prop_type.upper()
     if t in {"INT", "INT32", "INT64", "LONG"}:
         if isinstance(value, bool):
@@ -194,15 +236,17 @@ def test_generate_catalog_graphml_counts_and_labels():
 
     tree = pgs_generate.build_graphml(nodes, edges, node_prop_names, edge_prop_names)
     root = tree.getroot()
-    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
-    labels_keys = root.findall("g:key[@for='node'][@attr.name='labels']", ns)
+    labels_keys = root.findall("g:key[@for='node'][@attr.name='labels']", GRAPHML_NS)
     assert labels_keys
 
-    graph = root.find("g:graph", ns)
+    graph = root.find("g:graph", GRAPHML_NS)
     assert graph is not None
-    sample_node = graph.find("g:node", ns)
+    sample_node = graph.find("g:node", GRAPHML_NS)
     assert sample_node is not None
-    assert "labels" in sample_node.attrib
+    assert "labels" not in sample_node.attrib
+
+    key_names = _graphml_key_names(root)
+    assert _graphml_data_text(sample_node, key_names, "labels")
 
 
 def test_generate_fraud_graph_labels():
@@ -258,6 +302,51 @@ def test_keyword_property_name_parses_and_generates():
     )
     assert nodes
     assert not edges
+
+
+def test_list_property_types_parse_and_generate():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(LIST_PROPERTY_SCHEMA)
+
+    list_node = node_types["ListNodeType"]
+    prop_types = {prop.name: prop.prop_type for prop in list_node.spec.properties}
+    assert prop_types == {
+        "propKeyStrings": "LIST<STRING>",
+        "propKeyInts": "LIST<INT>",
+        "propKeyFloats": "LIST<FLOAT>",
+        "propKeyBooleans": "LIST<BOOLEAN>",
+        "propKeyDates": "LIST<DATE>",
+        "propKeyDatetimes": "LIST<DATETIME>",
+    }
+
+    semantics = pgs_generate.SchemaSemantics(node_types, edge_types)
+    options = semantics.eval_node_type("ListNodeType")
+    assert len(options) == 1
+    assert options[0].record_spec.required == prop_types
+
+    rng = pgs_generate.random.Random(29)
+    nodes, edges, _, _ = pgs_generate.generate_instances(
+        graph_types[0], node_types, edge_types, 1, rng
+    )
+
+    assert nodes
+    assert not edges
+    for node in nodes:
+        for key, prop_type in prop_types.items():
+            assert key in node.props
+            assert isinstance(node.props[key], list)
+            assert node.props[key]
+            assert _is_value_of_type(node.props[key], prop_type)
+
+
+def test_list_property_rejects_unknown_item_type():
+    schema = """
+    CREATE GRAPH TYPE G STRICT {
+      (N: Person {tags LIST<UUID>})
+    };
+    """
+
+    with pytest.raises(ValueError, match="Unsupported LIST item type UUID"):
+        pgs_generate.parse_schema(schema)
 
 
 def test_type_ref_prefix_parses_and_generates():
@@ -357,15 +446,15 @@ def test_edge_and_labels_graphml():
 
     tree = pgs_generate.build_graphml(nodes, edges, node_prop_names, edge_prop_names)
     root = tree.getroot()
-    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
-    labels_key = root.find("g:key[@for='edge'][@attr.name='labels']", ns)
+    labels_key = root.find("g:key[@for='edge'][@attr.name='labels']", GRAPHML_NS)
     assert labels_key is not None
-    graph = root.find("g:graph", ns)
-    edge_el = graph.find("g:edge", ns)
+    graph = root.find("g:graph", GRAPHML_NS)
+    edge_el = graph.find("g:edge", GRAPHML_NS)
     assert edge_el is not None
-    labels_data = edge_el.find("g:data[@key='e_labels']", ns)
+    assert "label" not in edge_el.attrib
+    labels_data = edge_el.find("g:data[@key='e_labels']", GRAPHML_NS)
     if labels_data is None:
-        labels_data = edge_el.find("g:data[@key='labels']", ns)
+        labels_data = edge_el.find("g:data[@key='labels']", GRAPHML_NS)
     assert labels_data is not None
     assert labels_data.text and ":REL_A" in labels_data.text and ":REL_B" in labels_data.text
 
@@ -380,7 +469,7 @@ def test_cli_open_extra_generates_graphml(tmp_path):
     schema_path = tmp_path / "schema.pgs"
     schema_path.write_text(schema, encoding="utf-8")
     out_path = tmp_path / "out.graphml"
-    result = subprocess.run(
+    subprocess.run(
         [
             sys.executable,
             "pgs_generate.py",
@@ -400,28 +489,25 @@ def test_cli_open_extra_generates_graphml(tmp_path):
     assert out_path.exists()
     tree = ET.parse(out_path)
     root = tree.getroot()
-    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
-    graph = root.find("g:graph", ns)
+    graph = root.find("g:graph", GRAPHML_NS)
     assert graph is not None
-    assert graph.find("g:node", ns) is not None
+    assert graph.find("g:node", GRAPHML_NS) is not None
 
-    keys = {}
-    for key_el in root.findall("g:key", ns):
-        keys[key_el.attrib["id"]] = key_el.attrib.get("attr.name", "")
+    keys = _graphml_key_names(root)
 
-    nodes = graph.findall("g:node", ns)
-    edges = graph.findall("g:edge", ns)
+    nodes = graph.findall("g:node", GRAPHML_NS)
+    edges = graph.findall("g:edge", GRAPHML_NS)
     assert nodes
     assert edges
 
     for node in nodes:
-        labels = (node.attrib.get("labels") or "").split(":")
+        labels = _graphml_data_text(node, keys, "labels").split(":")
         labels = [label for label in labels if label]
         extra_labels = [label for label in labels if label.startswith("ExtraLabel")]
         assert len(extra_labels) == 2
 
         extra_props = []
-        for data in node.findall("g:data", ns):
+        for data in node.findall("g:data", GRAPHML_NS):
             attr_name = keys.get(data.attrib.get("key", ""), "")
             if attr_name.startswith("extra_prop_"):
                 extra_props.append(attr_name)
@@ -429,7 +515,7 @@ def test_cli_open_extra_generates_graphml(tmp_path):
 
     edge_label_data = None
     for edge in edges:
-        for data in edge.findall("g:data", ns):
+        for data in edge.findall("g:data", GRAPHML_NS):
             attr_name = keys.get(data.attrib.get("key", ""), "")
             if attr_name == "labels":
                 edge_label_data = data.text or ""
@@ -441,7 +527,7 @@ def test_cli_open_extra_generates_graphml(tmp_path):
         assert len(extra_labels) == 2
 
         extra_props = []
-        for data in edge.findall("g:data", ns):
+        for data in edge.findall("g:data", GRAPHML_NS):
             attr_name = keys.get(data.attrib.get("key", ""), "")
             if attr_name.startswith("extra_prop_"):
                 extra_props.append(attr_name)
@@ -471,11 +557,44 @@ def test_cli_type_ref_prefix_generates_graphml(tmp_path):
 
     tree = ET.parse(out_path)
     root = tree.getroot()
-    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
-    graph = root.find("g:graph", ns)
+    graph = root.find("g:graph", GRAPHML_NS)
     assert graph is not None
-    assert graph.find("g:node", ns) is not None
-    assert graph.find("g:edge", ns) is not None
+    assert graph.find("g:node", GRAPHML_NS) is not None
+    assert graph.find("g:edge", GRAPHML_NS) is not None
+
+
+def test_cli_graphml_apoc_mode_emits_attr_list(tmp_path):
+    schema_path = tmp_path / "schema.pgs"
+    schema_path.write_text(APOC_TYPED_GRAPHML_SCHEMA, encoding="utf-8")
+    out_path = tmp_path / "out.graphml"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "pgs_generate.py",
+            str(schema_path),
+            "1",
+            "--format",
+            "graphml-apoc",
+            "-o",
+            str(out_path),
+        ],
+        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    tree = ET.parse(out_path)
+    root = tree.getroot()
+    list_key = root.find("g:key[@for='node'][@attr.name='propKeyList']", GRAPHML_NS)
+    assert list_key is not None
+    assert list_key.attrib.get("attr.list") == "string"
+
+    graph = root.find("g:graph", GRAPHML_NS)
+    node = graph.find("g:node", GRAPHML_NS)
+    assert node is not None
+    assert "labels" in node.attrib
 
 
 def test_open_extras_flag_adds_labels_and_props():
@@ -558,7 +677,7 @@ def test_graphml_tinkerpop_format():
     assert data_label.text
 
 
-def test_apoc_graphml_declares_property_types():
+def test_standard_graphml_declares_list_metadata():
     node_types, edge_types, graph_types = pgs_generate.parse_schema(APOC_TYPED_GRAPHML_SCHEMA)
     graph_type = graph_types[0]
     rng = pgs_generate.random.Random(41)
@@ -568,29 +687,80 @@ def test_apoc_graphml_declares_property_types():
     )
     tree = pgs_generate.build_graphml(nodes, edges, node_prop_names, edge_prop_names)
     root = tree.getroot()
-    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
 
+    xml_text = ET.tostring(root, encoding="unicode")
+    assert f'xmlns:pgs="{pgs_generate.PGS_GRAPHML_NS}"' in xml_text
+
+    node_key_elements = root.findall("g:key[@for='node']", GRAPHML_NS)
     node_keys = {
-        key_el.attrib["attr.name"]: key_el.attrib.get("attr.type")
-        for key_el in root.findall("g:key[@for='node']", ns)
+        key_el.attrib["attr.name"]: key_el.attrib.get("attr.type") for key_el in node_key_elements
     }
     edge_keys = {
         key_el.attrib["attr.name"]: key_el.attrib.get("attr.type")
-        for key_el in root.findall("g:key[@for='edge']", ns)
+        for key_el in root.findall("g:key[@for='edge']", GRAPHML_NS)
     }
+
+    list_key = root.find("g:key[@for='node'][@attr.name='propKeyList']", GRAPHML_NS)
+    assert list_key is not None
+    assert list_key.attrib.get("attr.type") == "string"
+    assert list_key.attrib[f"{{{pgs_generate.PGS_GRAPHML_NS}}}list"] == "string"
 
     assert node_keys["labels"] == "string"
     assert node_keys["propkeyInteger"] in {"int", "long"}
     assert node_keys["propKeyLong"] in {"int", "long"}
     assert node_keys["propKeyDouble"] == "double"
     assert node_keys["propKeyBoolean"] == "boolean"
+    assert node_keys["propKeyList"] == "string"
     assert edge_keys["label"] == "string"
 
-    graph = root.find("g:graph", ns)
-    node = graph.find("g:node", ns)
-    bool_data = node.find("g:data[@key='propKeyBoolean']", ns)
-    assert bool_data is not None
-    assert bool_data.text in {"true", "false"}
+    graph = root.find("g:graph", GRAPHML_NS)
+    node = graph.find("g:node", GRAPHML_NS)
+    assert "labels" not in node.attrib
+
+    key_names = _graphml_key_names(root)
+    assert _graphml_data_text(node, key_names, "labels")
+    assert _graphml_data_text(node, key_names, "propKeyBoolean") in {"true", "false"}
+    assert json.loads(_graphml_data_text(node, key_names, "propKeyList")) == nodes[0].props["propKeyList"]
+
+
+def test_apoc_graphml_declares_property_types():
+    node_types, edge_types, graph_types = pgs_generate.parse_schema(APOC_TYPED_GRAPHML_SCHEMA)
+    graph_type = graph_types[0]
+    rng = pgs_generate.random.Random(41)
+
+    nodes, edges, node_prop_names, edge_prop_names = pgs_generate.generate_instances(
+        graph_type, node_types, edge_types, 1, rng
+    )
+    tree = pgs_generate.build_graphml_apoc(nodes, edges, node_prop_names, edge_prop_names)
+    root = tree.getroot()
+
+    node_key_elements = root.findall("g:key[@for='node']", GRAPHML_NS)
+    node_keys = {
+        key_el.attrib["attr.name"]: key_el.attrib.get("attr.type") for key_el in node_key_elements
+    }
+    edge_keys = {
+        key_el.attrib["attr.name"]: key_el.attrib.get("attr.type")
+        for key_el in root.findall("g:key[@for='edge']", GRAPHML_NS)
+    }
+
+    list_key = root.find("g:key[@for='node'][@attr.name='propKeyList']", GRAPHML_NS)
+    assert list_key is not None
+    assert list_key.attrib.get("attr.list") == "string"
+
+    assert node_keys["labels"] == "string"
+    assert node_keys["propkeyInteger"] in {"int", "long"}
+    assert node_keys["propKeyLong"] in {"int", "long"}
+    assert node_keys["propKeyDouble"] == "double"
+    assert node_keys["propKeyBoolean"] == "boolean"
+    assert node_keys["propKeyList"] == "string"
+    assert edge_keys["label"] == "string"
+
+    graph = root.find("g:graph", GRAPHML_NS)
+    node = graph.find("g:node", GRAPHML_NS)
+    assert "labels" in node.attrib
+
+    key_names = _graphml_key_names(root)
+    assert json.loads(_graphml_data_text(node, key_names, "propKeyList")) == nodes[0].props["propKeyList"]
 
 
 def test_graphml_tinkerpop_labels_property():
@@ -1030,22 +1200,19 @@ def test_cli_mutation_flags_generate_nonconforming_graphml(tmp_path):
 
     tree = ET.parse(out_path)
     root = tree.getroot()
-    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
-    graph = root.find("g:graph", ns)
-    nodes = graph.findall("g:node", ns)
+    graph = root.find("g:graph", GRAPHML_NS)
+    nodes = graph.findall("g:node", GRAPHML_NS)
     assert nodes
 
-    keys = {}
-    for key_el in root.findall("g:key", ns):
-        keys[key_el.attrib["id"]] = key_el.attrib.get("attr.name", "")
+    keys = _graphml_key_names(root)
 
     for node in nodes:
-        labels = (node.attrib.get("labels") or "").split(":")
+        labels = _graphml_data_text(node, keys, "labels").split(":")
         labels = [label for label in labels if label]
         assert any(label.startswith("MutatedLabel") for label in labels)
         assert any(
             keys.get(data.attrib.get("key", ""), "").startswith("mutated_prop_")
-            for data in node.findall("g:data", ns)
+            for data in node.findall("g:data", GRAPHML_NS)
         )
 
 
@@ -1077,27 +1244,28 @@ def test_cli_typo_and_wrong_datatype_flags(tmp_path):
 
     tree = ET.parse(out_path)
     root = tree.getroot()
-    ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
-    graph = root.find("g:graph", ns)
-    nodes = graph.findall("g:node", ns)
-    edges = graph.findall("g:edge", ns)
+    graph = root.find("g:graph", GRAPHML_NS)
+    nodes = graph.findall("g:node", GRAPHML_NS)
+    edges = graph.findall("g:edge", GRAPHML_NS)
     assert nodes
     assert edges
 
-    keys = {}
-    for key_el in root.findall("g:key", ns):
-        keys[key_el.attrib["id"]] = key_el.attrib.get("attr.name", "")
+    keys = _graphml_key_names(root)
 
     for node in nodes:
-        labels = (node.attrib.get("labels") or "").split(":")
+        labels = _graphml_data_text(node, keys, "labels").split(":")
         labels = [label for label in labels if label]
         assert labels and labels[0] != "Person"
-        attr_names = [keys.get(data.attrib.get("key", ""), "") for data in node.findall("g:data", ns)]
+        attr_names = [
+            keys.get(data.attrib.get("key", ""), "") for data in node.findall("g:data", GRAPHML_NS)
+        ]
         assert "id" not in attr_names
 
     for edge in edges:
-        assert edge.attrib.get("label") != "KNOWS"
-        attr_names = [keys.get(data.attrib.get("key", ""), "") for data in edge.findall("g:data", ns)]
+        assert _graphml_data_text(edge, keys, "label") != "KNOWS"
+        attr_names = [
+            keys.get(data.attrib.get("key", ""), "") for data in edge.findall("g:data", GRAPHML_NS)
+        ]
         assert "since" not in attr_names
 
 

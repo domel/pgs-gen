@@ -1,0 +1,11 @@
+CREATE NODE TYPE
+(PersonWithLists : Person {
+  aliases LIST<STRING>,
+  tags LIST<STRING>,
+  luckyNumbers LIST<INT>,
+  activeFlags LIST<BOOLEAN>
+});
+
+CREATE GRAPH TYPE ListGraphType STRICT {
+    PersonWithLists
+}

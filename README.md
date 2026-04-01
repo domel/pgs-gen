@@ -2,12 +2,13 @@
 
 Generate random graph data from PG-Schema files and export it to multiple formats:
 
-- Neo4j APOC GraphML (default)
+- Standards-compliant GraphML with `pgs:list` metadata (default)
+- Neo4j APOC-compatible GraphML with `attr.list`
 - TinkerPop GraphML
 - GraphSON 3.0 (no embedded types)
 - Oracle Property Graph GraphSON
 
-The generator supports PG-Schema label/property semantics (including `|`, `&`, `?`, `OPEN`, and `ABSTRACT`).
+The generator supports PG-Schema label/property semantics (including `|`, `&`, `?`, `OPEN`, and `ABSTRACT`) and real list-valued properties via `LIST<datatype>`.
 
 ## Requirements
 
@@ -22,10 +23,16 @@ python3 -m pip install faker
 
 ## Usage
 
-Basic (Neo4j APOC GraphML):
+Basic (standards-compliant GraphML):
 
 ```bash
 python3 pgs_generate.py examples/FraudGraphType.pgs 1 -o out.graphml
+```
+
+Neo4j APOC-compatible GraphML:
+
+```bash
+python3 pgs_generate.py examples/FraudGraphType.pgs 1 --format graphml-apoc -o out.graphml
 ```
 
 TinkerPop GraphML:
@@ -55,7 +62,8 @@ python3 pgs_generate.py schema.pgs 1 --type-ref-prefix @ -o out.graphml
 ## CLI Options
 
 - `--format`: output format
-  - `apoc` (default) -> Neo4j APOC GraphML
+  - `graphml` (default) -> standards-compliant GraphML with `pgs:list` metadata for list-valued properties
+  - `graphml-apoc` / `apoc` -> Neo4j APOC-compatible GraphML with non-standard `attr.list`
   - `graphml-tp` -> TinkerPop GraphML
   - `graphson3` -> GraphSON 3.0 without embedded types
   - `oracle-graphson` -> Oracle Property Graph GraphSON
@@ -147,7 +155,7 @@ Example `mutation-report.json`:
     "graph_type": "FraudGraphType",
     "seed": 42,
     "scale": 1,
-    "format": "apoc"
+    "format": "graphml"
   },
   "summary": {
     "nodes_total": 50,
@@ -211,6 +219,29 @@ Only mutated objects are included in `objects`. The `summary.by_kind` counters t
 - `OPEN` allows extra labels/properties; use `--open-extra` to force them.
 - `ABSTRACT` types are never instantiated directly.
 
+## List Properties
+
+`LIST<datatype>` is treated as a real property type and generates actual Python lists in memory and JSON arrays encoded into GraphML `<data>` text.
+
+Default `graphml` mode stays standards-compliant:
+- list-valued keys use `attr.type="string"`
+- list values are serialized as JSON arrays inside the `<data>` element text
+- list metadata is preserved on the key as `pgs:list="<inner-type>"`
+
+`graphml-apoc` / `apoc` mode is intentionally non-standard and aimed at Neo4j/APOC interoperability:
+- list-valued keys emit `attr.list="<type>"`
+- this is practical for import workflows, but it is not formal GraphML compliance
+- `DATE` and `DATETIME` lists are exported as string lists in GraphML-based formats
+
+Only `LIST<datatype>` is treated as the explicit list feature. Bare `LIST` remains backward-compatible input, but it is not the structured list support described above.
+
+Example schema with list-valued properties:
+
+```bash
+python3 pgs_generate.py examples/ListGraphType.pgs 1 -o out.graphml
+python3 pgs_generate.py examples/ListGraphType.pgs 1 --format graphml-apoc -o out.apoc.graphml
+```
+
 ## Tests
 
 Run the test suite:
@@ -221,16 +252,24 @@ pytest -q
 
 ## Output Examples (abbreviated)
 
-Neo4j APOC GraphML:
+Standards-compliant GraphML (default):
 
 ```xml
+<key id="aliases" for="node" attr.name="aliases" attr.type="string" pgs:list="string" />
+<node id="n0">
+  <data key="labels">:Person</data>
+  <data key="aliases">["Alice","Al"]</data>
+</node>
+```
+
+Neo4j APOC-compatible GraphML:
+
+```xml
+<key id="aliases" for="node" attr.name="aliases" attr.type="string" attr.list="string" />
 <node id="n0" labels=":Person">
   <data key="labels">:Person</data>
-  <data key="name">Alice</data>
+  <data key="aliases">["Alice","Al"]</data>
 </node>
-<edge id="e0" source="n0" target="n1" label="KNOWS">
-  <data key="label">KNOWS</data>
-</edge>
 ```
 
 TinkerPop GraphML:

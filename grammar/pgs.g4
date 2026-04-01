@@ -64,7 +64,16 @@ properties : property ( SP? ',' SP? property )* ;
 
 property : (OPTIONAL SP)? key SP propertyType SP? ;
 
-propertyType : StringLiteral ;
+propertyType
+    : scalarPropertyType
+    | listPropertyType
+    ;
+
+listPropertyType
+    : LIST SP? '<' SP? scalarPropertyType SP? '>'
+    ;
+
+scalarPropertyType : StringLiteral ;
 
 key : StringLiteral ;
 
@@ -84,6 +93,7 @@ STRICT : ( 's' | 'S' ) ( 't' | 'T' ) ( 'r' | 'R' ) ( 'i' | 'I' ) ( 'c' | 'C' ) (
 LOOSE : ( 'l' | 'L' ) ( 'o' | 'O' ) ( 'o' | 'O' ) ( 's' | 'S' ) ( 'e' | 'E' ) ;
 ABSTRACT : ( 'a' | 'A' ) ( 'b' | 'B' ) ( 's' | 'S' ) ( 't' | 'T' ) ( 'r' | 'R' ) ( 'a' | 'A' ) ( 'c' | 'C' ) ( 't' | 'T' ) ;
 IMPORTS : ( 'i' | 'I' ) ( 'm' | 'M' ) ( 'p' | 'P' ) ( 'o' | 'O' ) ( 'r' | 'R' ) ( 't' | 'T' ) ( 's' | 'S' ) ;
+LIST : ( 'l' | 'L' ) ( 'i' | 'I' ) ( 's' | 'S' ) ( 't' | 'T' ) ;
 
 SP
     :  ( WHITESPACE )+ ;
@@ -200,4 +210,3 @@ rightArrowHead
   | '\ufe65'
   | '\uff1e'
   ;
-
